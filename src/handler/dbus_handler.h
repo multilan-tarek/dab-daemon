@@ -7,6 +7,7 @@
 
 #include <sdbus-c++/sdbus-c++.h>
 #include "tuner_handler.h"
+#include "../helper/logger.h"
 
 class DBusHandler {
 public:
@@ -17,6 +18,7 @@ public:
 private:
     std::unique_ptr<sdbus::IObject> object = nullptr;
     TunerHandler *tuner_handler = nullptr;
+    Logger logger{"DBUS"};
 };
 
 #endif //DBUS_HANDLER_H

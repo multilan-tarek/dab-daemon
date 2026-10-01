@@ -7,6 +7,7 @@
 
 #include <functional>
 #include <libusb-1.0/libusb.h>
+#include "../helper/logger.h"
 
 class USBHandler {
 public:
@@ -35,6 +36,7 @@ private:
 
     std::function<void(Device)> connect_callback = nullptr;
     std::function<void(Device)> disconnect_callback = nullptr;
+    Logger logger{"USB"};
 
     static int hotplug_callback(libusb_context *, libusb_device *device, libusb_hotplug_event event, void *obj);
 };

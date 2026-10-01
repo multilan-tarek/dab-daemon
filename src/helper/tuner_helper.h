@@ -5,8 +5,10 @@
 #ifndef TUNER_HELPER_H
 #define TUNER_HELPER_H
 
+#include <functional>
 #include <vector>
 #include <libusb-1.0/libusb.h>
+#include "logger.h"
 
 class TunerHelper {
 public:
@@ -78,7 +80,7 @@ public:
         ADC_CLOCK_FREQ_8_MHz, //10C: 213360,
         ADC_CLOCK_FREQ_8_192_MHz, //10D: 215072,
         ADC_CLOCK_FREQ_9_6_MHz, //11A: 216928,
-        ADC_CLOCK_FREQ_8_192_MHz, //11N: 217008,
+        ADC_CLOCK_FREQ_8_192_MHz, //11N: 217088,
         ADC_CLOCK_FREQ_8_192_MHz, //11B: 218640,
         ADC_CLOCK_FREQ_8_192_MHz, //11C: 220352,
         ADC_CLOCK_FREQ_8_MHz, //11D: 222064,
@@ -172,7 +174,7 @@ public:
         0
     };
 
-    explicit TunerHelper(libusb_device_handle *device_handle);
+    explicit TunerHelper(int tuner_id, libusb_device_handle *device_handle, const std::function<void(const std::vector<uint8_t> &)> &fic_callback, const std::function<void(const std::vector<uint8_t> &)> &msc_callback);
 
     void switch_page(RegisterPage register_page) const;
 
@@ -182,10 +184,20 @@ public:
 
     bool power_up() const;
 
-    bool set_frequency(uint32_t frequency) const;
+    bool set_frequency(uint32_t frequency);
+
+    void open_subchannel(uint8_t subchannel);
+
+    void read_data() const;
 
 private:
     libusb_device_handle *device_handle = nullptr;
+
+    std::function<void(const std::vector<uint8_t> &)> fic_callback = nullptr;
+    std::function<void(const std::vector<uint8_t> &)> msc_callback = nullptr;
+
+    uint8_t current_subchannel = 0xFF;
+    Logger logger{"TUNER"};
 
     int bulk_transfer(uint8_t endpoint, std::vector<uint8_t> &buffer) const;
 
@@ -220,6 +232,8 @@ private:
     void setup_msc_threshold() const;
 
     void setup_memory_fic() const;
+
+    void clear_and_setup_msc_memory() const;
 };
 
 #endif //TUNER_HELPER_H

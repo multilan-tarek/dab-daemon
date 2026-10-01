@@ -5,10 +5,12 @@
 #ifndef MAIN_HANDLER_H
 #define MAIN_HANDLER_H
 
+#include <mutex>
 #include <sdbus-c++/sdbus-c++.h>
 #include "dbus_handler.h"
 #include "tuner_handler.h"
 #include "usb_handler.h"
+#include "../helper/logger.h"
 
 class MainHandler {
 public:
@@ -36,8 +38,12 @@ private:
     std::unique_ptr<sdbus::IObject> dbus_root_object = nullptr;
 
     std::vector<Device *> devices;
+    mutable std::mutex devices_mutex;
+    Logger logger{"MAIN"};
 
     int generate_tuner_id() const;
+
+    std::vector<sdbus::ObjectPath> get_tuner_paths() const;
 };
 
 #endif //MAIN_HANDLER_H

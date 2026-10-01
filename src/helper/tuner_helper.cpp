@@ -3,17 +3,28 @@
 //
 
 #include "tuner_helper.h"
-#include <iostream>
+#include <algorithm>
+#include <chrono>
+#include <format>
+#include <iterator>
+#include <thread>
 #include <vector>
-#include <bits/this_thread_sleep.h>
 
-TunerHelper::TunerHelper(libusb_device_handle *device_handle) {
+TunerHelper::TunerHelper(const int tuner_id, libusb_device_handle *device_handle, const std::function<void(const std::vector<uint8_t> &)> &fic_callback, const std::function<void(const std::vector<uint8_t> &)> &msc_callback) {
+    logger.set_id(tuner_id);
     this->device_handle = device_handle;
+    this->fic_callback = fic_callback;
+    this->msc_callback = msc_callback;
 }
 
 int TunerHelper::bulk_transfer(const uint8_t endpoint, std::vector<uint8_t> &buffer) const {
-    int transferred;
-    libusb_bulk_transfer(device_handle, endpoint, buffer.data(), buffer.size(), &transferred, 5000);
+    int transferred = 0;
+    const int result = libusb_bulk_transfer(device_handle, endpoint, buffer.data(), buffer.size(), &transferred, 5000);
+
+    if (result != LIBUSB_SUCCESS) {
+        logger.error(std::format("USB bulk transfer on endpoint 0x{:02X} failed: {}", endpoint, libusb_error_name(result)));
+    }
+
     return transferred;
 }
 
@@ -38,36 +49,75 @@ uint8_t TunerHelper::read_register(const uint8_t reg) const {
 }
 
 bool TunerHelper::power_up() const {
-    //trying some time to power the chip up
+    const auto initialization_start = std::chrono::steady_clock::now();
+
+    logger.info("Starting hardware initialization");
+    logger.info("Checking host communication");
 
     for (int i = 0; i < 100; i++) {
         switch_page(REGISTER_PAGE_HOST);
         set_register(0x7D, 0x06);
 
-        if (read_register(0x7D) == 0x06) {
-            std::cout << "Tuner Handler: Power-Up successful" << std::endl;
-
-            configure_power_type();
-            configure_adc_clock();
-            tdmb_init_top();
-            tdmb_init_comm();
-            tdmb_init_host();
-            tdmb_init_of_dm();
-            tdmb_init_fec();
-            reset_memory_fic();
-            oem_configure_interrupt();
-            stream_disable();
-            configure_host_if();
-            rf_initialize();
-            rf_special();
-            setup_msc_threshold();
-            setup_memory_fic();
-
-            return true;
+        if (read_register(0x7D) != 0x06) {
+            continue;
         }
+
+        logger.info("Host communication ready");
+        logger.debug(std::format("Power-up handshake successful after {} attempt(s)", i + 1));
+
+        auto phase_start = std::chrono::steady_clock::now();
+        logger.info("Configuring power and ADC clock");
+        logger.debug("Configuring power type");
+        configure_power_type();
+        logger.debug("Configuring ADC clock");
+        configure_adc_clock();
+        logger.debug(std::format("Power and ADC clock configured in {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - phase_start).count()));
+
+        phase_start = std::chrono::steady_clock::now();
+        logger.info("Initializing DAB baseband");
+        logger.debug("Initializing top block");
+        tdmb_init_top();
+        logger.debug("Initializing communication block");
+        tdmb_init_comm();
+        logger.debug("Initializing host block");
+        tdmb_init_host();
+        logger.debug("Initializing OFDM block");
+        tdmb_init_of_dm();
+        logger.debug("Initializing FEC block");
+        tdmb_init_fec();
+        logger.debug(std::format("DAB baseband initialized in {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - phase_start).count()));
+
+        phase_start = std::chrono::steady_clock::now();
+        logger.info("Configuring host interface and interrupts");
+        logger.debug("Resetting FIC memory");
+        reset_memory_fic();
+        logger.debug("Configuring interrupt output");
+        oem_configure_interrupt();
+        logger.debug("Disabling stream output during setup");
+        stream_disable();
+        logger.debug("Configuring host interface");
+        configure_host_if();
+        logger.debug(std::format("Host interface and interrupts configured in {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - phase_start).count()));
+
+        phase_start = std::chrono::steady_clock::now();
+        logger.info("Initializing RF frontend");
+        logger.debug("Writing RF initialization table");
+        rf_initialize();
+        logger.debug("Running RF special setup");
+        rf_special();
+        logger.debug(std::format("RF frontend initialized in {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - phase_start).count()));
+
+        phase_start = std::chrono::steady_clock::now();
+        logger.info("Configuring FIC and MSC buffers");
+        setup_msc_threshold();
+        setup_memory_fic();
+        logger.debug(std::format("FIC and MSC buffers configured in {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - phase_start).count()));
+
+        logger.info(std::format("Hardware initialization complete in {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - initialization_start).count()));
+        return true;
     }
 
-    std::cout << "Tuner Handler: Power-Up failed" << std::endl;
+    logger.error(std::format("Power-up handshake failed after 100 attempts ({} ms)", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - initialization_start).count()));
     return false;
 }
 
@@ -109,15 +159,19 @@ void TunerHelper::configure_adc_clock() const {
     set_register(0xED, REGED | ADC_CLOCK_CONFIG[0][5]);
     set_register(0xEE, REGEE | ADC_CLOCK_CONFIG[0][6]);
 
-    for (int i = 0; i < 10; i++) {
-        uint8_t RD15 = read_register(0x15);
-        RD15 = static_cast<uint8_t>(RD15 & 0x01);
+    bool locked = false;
 
-        if (RD15 > 0) {
+    for (int i = 0; i < 10; i++) {
+        if ((read_register(0x15) & 0x01) != 0) {
+            locked = true;
             break;
         }
+    }
 
-        std::cout << "Tuner Handler: ADCClock SYNTH 1st step  UnLock..." << std::endl;
+    if (locked) {
+        logger.debug("ADC clock synthesizer locked at 8 MHz");
+    } else {
+        logger.warning("ADC clock synthesizer did not lock during initialization");
     }
 }
 
@@ -345,7 +399,7 @@ void TunerHelper::tdmb_init_of_dm() const {
 
     set_register(0x6A, 0x01);
 
-    switch_page(REGISTER_PAGE_FM); //instead of OFDM page
+    switch_page(REGISTER_PAGE_FM);
 
     set_register(0x3C, 0x4B);
     set_register(0x3D, 0x37);
@@ -396,7 +450,7 @@ void TunerHelper::tdmb_init_of_dm() const {
 }
 
 void TunerHelper::tdmb_init_fec() const {
-    switch_page(REGISTER_PAGE_DD); //instead of FEC_PAGE
+    switch_page(REGISTER_PAGE_DD);
 
     set_register(0x80, 0x80);
     set_register(0x81, 0xFF);
@@ -551,6 +605,7 @@ void TunerHelper::rf_initialize() const {
     set_register(0x39, 0x2C);
 
     const short check_val = static_cast<short>((read_register(0x10) << 8 | read_register(0x11)) & 0xFFFF);
+    logger.debug(std::format("RF check value: 0x{:04X}", static_cast<uint16_t>(check_val)));
 
     if (check_val != static_cast<short>(0xFFFF)) {
         set_register(0x2C, 0x48);
@@ -591,38 +646,26 @@ void TunerHelper::rf_special() const {
 }
 
 void TunerHelper::setup_msc_threshold() const {
-    std::cout << "Tuner Handler: Setting up MSC threshold..." << std::endl;
-
     switch_page(REGISTER_PAGE_DD);
 
-    //1536
-    //setRegister(0x56, 0x00);
-    //setRegister(0x57, 0xD8);
-
-    //Threshold at 1024
-    //setRegister(0x56, 0x04);
-    //setRegister(0x57, 0x00);
-
-    //Threshold at 2048
     set_register(0x56, 0x08);
     set_register(0x57, 0x00);
 
     switch_page(REGISTER_PAGE_DD);
+    logger.debug("MSC threshold configured: 2048 bytes");
 }
 
 void TunerHelper::setup_memory_fic() const {
-    std::cout << "Tuner Handler: Setting up FIC memory..." << std::endl;
-
     switch_page(REGISTER_PAGE_DD);
 
-    /* auto user clr, get fic  CRC 2byte including[4] */
     set_register(0x46, 0x14);
-
     set_register(0x46, 0x16);
+    logger.debug("FIC memory configured");
 }
 
-bool TunerHelper::set_frequency(const uint32_t frequency) const {
+bool TunerHelper::set_frequency(const uint32_t frequency) {
     if (frequency < FREQ_START) {
+        logger.warning(std::format("Frequency {} kHz is below Band III", frequency));
         return false;
     }
 
@@ -630,7 +673,7 @@ bool TunerHelper::set_frequency(const uint32_t frequency) const {
 
     if (frequency >= 224096) {
         index += 3;
-    } else if (frequency >= 217008) {
+    } else if (frequency >= 217088) {
         index += 2;
     } else if (frequency >= 210096) {
         index += 1;
@@ -639,12 +682,14 @@ bool TunerHelper::set_frequency(const uint32_t frequency) const {
     constexpr size_t table_size = std::size(ADC_CLOCK_ENSEMBLE_MAP);
 
     if (index < 0 || static_cast<size_t>(index) >= table_size) {
+        logger.warning(std::format("Frequency {} kHz is outside the supported Band III table", frequency));
         return false;
     }
 
     const uint8_t adc_clock_type = ADC_CLOCK_ENSEMBLE_MAP[index];
 
     if (!changed_adc_clock(adc_clock_type)) {
+        logger.warning(std::format("Could not configure ADC clock type {}", adc_clock_type));
         return false;
     }
 
@@ -672,12 +717,100 @@ bool TunerHelper::set_frequency(const uint32_t frequency) const {
     set_register(0x20, 0x00);
 
     if (!pll_locked) {
+        logger.warning(std::format("RF PLL did not lock within {} ms", PLL_TIMEOUT_MS));
         return false;
     }
+
+    logger.debug(std::format("RF PLL locked after {} ms", waited_ms));
 
     switch_page(REGISTER_PAGE_FM);
     set_register(0x10, 0x48);
     set_register(0x10, 0xC9);
 
+    current_subchannel = 0xFF;
+    logger.debug(std::format("RF tuned to {} kHz", frequency));
     return true;
+}
+
+void TunerHelper::open_subchannel(const uint8_t subchannel) {
+    if (current_subchannel == subchannel) {
+        return;
+    }
+
+    switch_page(REGISTER_PAGE_DD);
+    set_register(INT_E_UCLRL, 0x70);
+
+    switch_page(REGISTER_PAGE_HOST);
+    set_register(0x62, 0x00);
+
+    switch_page(REGISTER_PAGE_DD);
+    set_register(0x3A, static_cast<uint8_t>(0x80 | subchannel));
+    current_subchannel = subchannel;
+
+    clear_and_setup_msc_memory();
+    logger.debug(std::format("MSC subchannel set to {}", subchannel));
+}
+
+void TunerHelper::read_data() const {
+    switch_page(REGISTER_PAGE_DD);
+
+    const uint8_t interrupt_status = read_register(INT_E_STATL);
+    const bool msc1_overrun = (interrupt_status & MSC1_E_OVER_FLOW) != 0;
+    const bool msc1_underrun = (interrupt_status & MSC1_E_UNDER_FLOW) != 0;
+    const bool msc1_interrupt = (interrupt_status & MSC1_E_INT) != 0;
+    const bool fic_interrupt = (interrupt_status & FIC_E_INT) != 0;
+
+    if (fic_interrupt) {
+        switch_page(REGISTER_PAGE_FIC);
+
+        std::vector<uint8_t> request{0x22, 0x00, 0x80, 0x01, 0x10};
+        bulk_transfer(ENDPOINT_OUT, request);
+
+        std::vector<uint8_t> response(400);
+        const int transferred = bulk_transfer(ENDPOINT_IN, response);
+
+        switch_page(REGISTER_PAGE_DD);
+        set_register(INT_E_UCLRL, 0x01);
+
+        if (fic_callback && transferred >= 4) {
+            fic_callback(std::vector(response.begin() + 4, response.begin() + transferred));
+        }
+    }
+
+    if (msc1_overrun || msc1_underrun) {
+        if (msc1_overrun) {
+            logger.warning("MSC1 memory overrun");
+        }
+
+        if (msc1_underrun) {
+            logger.warning("MSC1 memory underrun");
+        }
+
+        clear_and_setup_msc_memory();
+        return;
+    }
+
+    if (msc1_interrupt) {
+        switch_page(REGISTER_PAGE_MSC1);
+
+        std::vector<uint8_t> request{0x22, 0x00, 0x00, 0x08, 0x10};
+        bulk_transfer(ENDPOINT_OUT, request);
+
+        std::vector<uint8_t> response(4096);
+        const int transferred = bulk_transfer(ENDPOINT_IN, response);
+
+        if (msc_callback && transferred >= 4) {
+            msc_callback(std::vector(response.begin() + 4, response.begin() + transferred));
+        }
+
+        switch_page(REGISTER_PAGE_DD);
+        set_register(INT_E_UCLRL, 0x04);
+    }
+
+}
+
+void TunerHelper::clear_and_setup_msc_memory() const {
+    switch_page(REGISTER_PAGE_DD);
+    set_register(0x48, 0x00);
+    set_register(0x48, 0x05);
 }
