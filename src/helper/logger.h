@@ -1,7 +1,3 @@
-//
-// Created by tarek on 10/1/26.
-//
-
 #ifndef LOGGER_H
 #define LOGGER_H
 

@@ -1,11 +1,16 @@
-//
-// Created by tarek on 9/30/26.
-//
-
 #ifndef DBUS_HANDLER_H
 #define DBUS_HANDLER_H
 
 #include <sdbus-c++/sdbus-c++.h>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <set>
+#include <string>
+#include <thread>
+#include <vector>
 #include "tuner_handler.h"
 #include "../helper/logger.h"
 
@@ -15,10 +20,34 @@ public:
 
     ~DBusHandler();
 
+    void emit_interfaces_added_signal();
+    void emit_interfaces_removed_signal();
+
+    void emit_pending_property_changes();
+
 private:
+    struct Command {
+        sdbus::Result<bool> result;
+        std::function<bool()> action;
+        std::chrono::steady_clock::time_point deadline;
+    };
+
     std::unique_ptr<sdbus::IObject> object = nullptr;
     TunerHandler *tuner_handler = nullptr;
+    std::mutex pending_properties_mutex;
+    std::set<std::string> pending_properties;
+    std::mutex command_mutex;
+    std::condition_variable command_condition;
+    std::deque<Command> commands;
+    std::thread command_thread;
+    bool commands_running = true;
     Logger logger{"DBUS"};
+
+    void property_change_event(const std::vector<std::string> &properties);
+
+    void queue_command(sdbus::Result<bool> result, const std::function<bool()> &action);
+
+    void process_commands();
 };
 
 #endif //DBUS_HANDLER_H

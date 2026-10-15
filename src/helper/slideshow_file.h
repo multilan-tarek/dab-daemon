@@ -1,7 +1,3 @@
-//
-// Created by tarek on 10/1/26.
-//
-
 #ifndef SLIDESHOW_FILE_H
 #define SLIDESHOW_FILE_H
 
@@ -16,14 +12,15 @@ public:
 
     ~SlideShowFile();
 
-    std::string get_path() const;
+    std::string write(uint16_t transport_id, const std::vector<uint8_t> &data, const std::string &extension);
 
-    void write(const std::vector<uint8_t> &data, const std::string &extension);
+    void remove(const std::string &path) const;
 
     void clear() const;
 
 private:
-    std::string path;
+    std::string directory;
+    uint64_t sequence = 0;
     Logger logger{"SLIDESHOW"};
 };
 

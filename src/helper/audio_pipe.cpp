@@ -1,7 +1,3 @@
-//
-// Created by tarek on 10/1/26.
-//
-
 #include "audio_pipe.h"
 #include <cerrno>
 #include <filesystem>

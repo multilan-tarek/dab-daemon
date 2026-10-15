@@ -1,7 +1,3 @@
-//
-// Created by tarek on 10/1/26.
-//
-
 #ifndef LOAS_ENCODER_H
 #define LOAS_ENCODER_H
 

@@ -1,14 +1,12 @@
-//
-// Created by tarek on 10/1/26.
-//
-
 #ifndef MSC_DECODER_H
 #define MSC_DECODER_H
 
+#include "../helper/audio_statistics.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <utility>
 #include <vector>
 
 class MSCDecoder {
@@ -30,6 +28,10 @@ public:
 
     void process(const std::vector<uint8_t> &data);
 
+#if DAB_ENABLE_DIAGNOSTICS
+    AudioStatistics get_statistics();
+#endif
+
 private:
     struct Superframe {
         std::vector<uint8_t> data;
@@ -49,7 +51,7 @@ private:
 
         ~ReedSolomonDecoder();
 
-        void decode(std::vector<uint8_t> &data);
+        std::pair<uint32_t, uint32_t> decode(std::vector<uint8_t> &data);
 
     private:
         void *handle = nullptr;
@@ -71,6 +73,10 @@ private:
     std::vector<uint8_t> input_buffer;
     bool frame_alignment_valid = false;
     uint8_t aligned_frame_count = 0;
+
+#if DAB_ENABLE_DIAGNOSTICS
+    AudioStatistics statistics;
+#endif
 
     void synchronize(const std::vector<uint8_t> &data);
 

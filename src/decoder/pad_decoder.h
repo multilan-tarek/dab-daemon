@@ -1,7 +1,3 @@
-//
-// Created by tarek on 10/1/26.
-//
-
 #ifndef PAD_DECODER_H
 #define PAD_DECODER_H
 

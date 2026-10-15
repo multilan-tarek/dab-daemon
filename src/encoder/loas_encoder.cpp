@@ -1,7 +1,3 @@
-//
-// Created by tarek on 10/1/26.
-//
-
 /*
  * Portions of this file are derived from the IRT DAB library.
  * Copyright (C) 2018 IRT GmbH, Fabian Sattler.

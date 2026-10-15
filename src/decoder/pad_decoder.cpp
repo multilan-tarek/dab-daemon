@@ -1,7 +1,3 @@
-//
-// Created by tarek on 10/1/26.
-//
-
 #include "pad_decoder.h"
 #include <algorithm>
 
@@ -92,8 +88,6 @@ void PADDecoder::process(const std::vector<uint8_t> &xpad_data, const std::array
     }
 
     size_t offset = content_indicator_length;
-    bool dynamic_label_continues = false;
-    ContentIndicator mot_continuation;
 
     for (const auto &content_indicator: content_indicators) {
         if (offset + content_indicator.length > xpad.size()) {
@@ -102,22 +96,22 @@ void PADDecoder::process(const std::vector<uint8_t> &xpad_data, const std::array
 
         if ((content_indicator.type == 2 || content_indicator.type == 3) && dynamic_label_callback) {
             dynamic_label_callback(content_indicator.type == 2, std::vector(xpad.begin() + offset, xpad.begin() + offset + content_indicator.length));
-            dynamic_label_continues = true;
-        } else if ((content_indicator.type == 1 || content_indicator.type == 12 || content_indicator.type == 13) && mot_callback) {
+        } else if ((content_indicator.type == 1 || (content_indicator.type >= 4 && content_indicator.type <= 30)) && mot_callback) {
             mot_callback(content_indicator.type, std::vector(xpad.begin() + offset, xpad.begin() + offset + content_indicator.length));
-
-            if (content_indicator.type == 12 || content_indicator.type == 13) {
-                mot_continuation = ContentIndicator(content_indicator.length, 13);
-            }
         }
 
         offset += content_indicator.length;
     }
 
-    if (mot_continuation.type != -1) {
-        last_content_indicator = mot_continuation;
-    } else if (dynamic_label_continues) {
+    const int last_type = content_indicators.back().type;
+
+    // Without CIs the entire previous X-PAD field continues its last subfield
+    // (ETSI EN 300 401, 7.4.2), including the space previously occupied by CIs.
+    if (last_type == 2 || last_type == 3) {
         last_content_indicator = ContentIndicator(offset, 3);
+    } else if (last_type >= 4 && last_type <= 30) {
+        const int continuation_type = last_type % 2 == 0 ? last_type + 1 : last_type;
+        last_content_indicator = ContentIndicator(offset, continuation_type);
     }
 }
 

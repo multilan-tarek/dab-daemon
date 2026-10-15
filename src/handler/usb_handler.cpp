@@ -1,7 +1,3 @@
-//
-// Created by tarek on 9/30/26.
-//
-
 #include "usb_handler.h"
 #include <format>
 
@@ -17,6 +13,11 @@ USBHandler::USBHandler(const std::function<void(Device)> &connect_callback, cons
 }
 
 void USBHandler::init() {
+    if (!context) {
+        logger.error("Cannot initialize hotplug monitoring without a libusb context");
+        return;
+    }
+
     if (!libusb_has_capability(LIBUSB_CAP_HAS_HOTPLUG)) {
         logger.error("This libusb version does not support hotplugging");
         return;
@@ -39,6 +40,7 @@ void USBHandler::init() {
         return;
     }
 
+    hotplug_registered = true;
     logger.debug("Hotplug monitoring initialized");
 }
 
@@ -47,16 +49,27 @@ USBHandler::~USBHandler() {
         return;
     }
 
-    libusb_hotplug_deregister_callback(context, callback_handle);
+    if (hotplug_registered) {
+        libusb_hotplug_deregister_callback(context, callback_handle);
+    }
+
     libusb_exit(context);
 }
 
-void USBHandler::handle() const {
-    const int result = libusb_handle_events(context);
+void USBHandler::handle() {
+    if (!context) {
+        return;
+    }
+
+    dispatch_hotplug_events();
+    timeval timeout{0, 100000};
+    const int result = libusb_handle_events_timeout_completed(context, &timeout, nullptr);
 
     if (result != LIBUSB_SUCCESS && result != LIBUSB_ERROR_INTERRUPTED) {
         logger.warning(std::format("Event handling failed: {}", libusb_error_name(result)));
     }
+
+    dispatch_hotplug_events();
 }
 
 int USBHandler::hotplug_callback(libusb_context *, libusb_device *device, const libusb_hotplug_event event, void *obj) {
@@ -82,26 +95,44 @@ int USBHandler::hotplug_callback(libusb_context *, libusb_device *device, const 
         address
     });
 
-    const std::string details = std::format("bus {}, address {}, ID {:04X}:{:04X}", clean_device.bus, clean_device.address, clean_device.vendor_id, clean_device.device_id);
-
-    if (event == LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED) {
-        object->logger.info(std::format("Device connected: {}", details));
-
-        if (object->connect_callback) {
-            object->connect_callback(clean_device);
-        }
-    } else if (event == LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT) {
-        object->logger.info(std::format("Device disconnected: {}", details));
-
-        if (object->disconnect_callback) {
-            object->disconnect_callback(clean_device);
-        }
-    }
-
+    // Device setup and teardown may use synchronous USB transfers or join the read thread.
+    const std::lock_guard lock(object->pending_events_mutex);
+    object->pending_events.emplace_back(clean_device, event);
     return 0;
 }
 
+void USBHandler::dispatch_hotplug_events() {
+    std::vector<std::pair<Device, libusb_hotplug_event>> events;
+
+    {
+        const std::lock_guard lock(pending_events_mutex);
+        events.swap(pending_events);
+    }
+
+    for (const auto &[device, event]: events) {
+        const std::string details = std::format("bus {}, address {}, ID {:04X}:{:04X}", device.bus, device.address, device.vendor_id, device.device_id);
+
+        if (event == LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED) {
+            logger.info(std::format("Device connected: {}", details));
+
+            if (connect_callback) {
+                connect_callback(device);
+            }
+        } else if (event == LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT) {
+            logger.info(std::format("Device disconnected: {}", details));
+
+            if (disconnect_callback) {
+                disconnect_callback(device);
+            }
+        }
+    }
+}
+
 libusb_device_handle *USBHandler::get_device_handle(const Device device) const {
+    if (!context) {
+        return nullptr;
+    }
+
     libusb_device **list = nullptr;
     const ssize_t count = libusb_get_device_list(context, &list);
 
@@ -116,6 +147,12 @@ libusb_device_handle *USBHandler::get_device_handle(const Device device) const {
         libusb_device *dev = list[i];
 
         if (libusb_get_bus_number(dev) != device.bus || libusb_get_device_address(dev) != device.address) {
+            continue;
+        }
+
+        libusb_device_descriptor descriptor{};
+
+        if (libusb_get_device_descriptor(dev, &descriptor) != LIBUSB_SUCCESS || descriptor.idVendor != device.vendor_id || descriptor.idProduct != device.device_id) {
             continue;
         }
 

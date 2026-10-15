@@ -1,7 +1,3 @@
-//
-// Created by tarek on 2/23/26.
-//
-
 #ifndef PARTIAL_H
 #define PARTIAL_H
 

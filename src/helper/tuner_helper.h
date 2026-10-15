@@ -1,17 +1,58 @@
-//
-// Created by tarek on 9/30/26.
-//
-
 #ifndef TUNER_HELPER_H
 #define TUNER_HELPER_H
 
+#include <atomic>
+#include <chrono>
 #include <functional>
+#include <mutex>
 #include <vector>
 #include <libusb-1.0/libusb.h>
 #include "logger.h"
+#include "signal_metrics.h"
 
 class TunerHelper {
 public:
+    struct USBStatus {
+        int32_t last_error = LIBUSB_SUCCESS;
+        int64_t last_error_time = 0;
+        uint64_t errors = 0;
+        uint64_t timeouts = 0;
+    };
+
+    class Operation {
+    public:
+        Operation(const TunerHelper &helper, std::chrono::milliseconds timeout);
+
+        ~Operation();
+
+        Operation(const Operation &) = delete;
+
+        Operation &operator=(const Operation &) = delete;
+
+        bool succeeded() const;
+
+    private:
+        const TunerHelper &helper;
+        bool previous_active;
+        std::chrono::steady_clock::time_point previous_deadline;
+    };
+
+    static constexpr auto INITIALIZATION_TIMEOUT = std::chrono::seconds(5);
+    static constexpr auto TUNING_TIMEOUT = std::chrono::seconds(2);
+    static constexpr auto RECEIVE_TIMEOUT = std::chrono::seconds(1);
+    static constexpr auto RECOVERY_TIMEOUT = std::chrono::seconds(7);
+
+    struct SignalStatus {
+        bool ofdm_lock = false;
+        bool fec_lock = false;
+        bool fec_sync = false;
+        bool msc_cer_valid = false;
+        uint8_t antenna_level = 0;
+        uint32_t msc_cer = 0;
+
+        bool operator==(const SignalStatus &other) const = default;
+    };
+
     constexpr static int FREQ_START = 174928;
     constexpr static int FREQ_STEP = 1712;
 
@@ -163,18 +204,7 @@ public:
     static constexpr uint8_t RTV_DAB_FEC_LOCK_MASK = 0x02;
     static constexpr uint8_t RTV_DAB_CHANNEL_LOCK_OK = (RTV_DAB_OFDM_LOCK_MASK | RTV_DAB_FEC_LOCK_MASK);
 
-    static constexpr uint8_t DAB_MAX_NUM_ANTENNA_LEVEL = 0x07;
-    static constexpr uint32_t AntLvlTbl[DAB_MAX_NUM_ANTENNA_LEVEL]{
-        810,
-        700,
-        490,
-        400,
-        250,
-        180,
-        0
-    };
-
-    explicit TunerHelper(int tuner_id, libusb_device_handle *device_handle, const std::function<void(const std::vector<uint8_t> &)> &fic_callback, const std::function<void(const std::vector<uint8_t> &)> &msc_callback);
+    explicit TunerHelper(int tuner_id, libusb_device_handle *device_handle, const std::function<void(const std::vector<uint8_t> &)> &fic_callback, const std::function<void(const std::vector<uint8_t> &)> &msc_callback, const std::function<void(const std::vector<uint8_t> &)> &background_msc_callback = nullptr);
 
     void switch_page(RegisterPage register_page) const;
 
@@ -188,18 +218,46 @@ public:
 
     void open_subchannel(uint8_t subchannel);
 
+    void open_background_subchannel(uint8_t subchannel);
+
+    void close_background_subchannel();
+
     void read_data() const;
+
+    SignalStatus get_signal_status() const;
+
+    int take_usb_error() const;
+
+    USBStatus get_usb_status() const;
+
+    Operation begin_operation(std::chrono::milliseconds timeout) const;
+
+    void cancel_operations();
 
 private:
     libusb_device_handle *device_handle = nullptr;
 
     std::function<void(const std::vector<uint8_t> &)> fic_callback = nullptr;
     std::function<void(const std::vector<uint8_t> &)> msc_callback = nullptr;
+    std::function<void(const std::vector<uint8_t> &)> background_msc_callback = nullptr;
 
     uint8_t current_subchannel = 0xFF;
+    uint8_t background_subchannel = 0xFF;
     Logger logger{"TUNER"};
+    mutable std::atomic_int pending_usb_error{LIBUSB_SUCCESS};
+    std::atomic_bool operations_cancelled = false;
+    mutable std::atomic_bool device_lost = false;
+    mutable bool operation_active = false;
+    mutable int operation_error = LIBUSB_SUCCESS;
+    mutable std::chrono::steady_clock::time_point operation_deadline;
+    mutable std::mutex usb_status_mutex;
+    mutable USBStatus usb_status;
 
     int bulk_transfer(uint8_t endpoint, std::vector<uint8_t> &buffer) const;
+
+    int check_operation() const;
+
+    void record_usb_error(int error) const;
 
     void configure_power_type() const;
 
@@ -234,6 +292,8 @@ private:
     void setup_memory_fic() const;
 
     void clear_and_setup_msc_memory() const;
+
+    void clear_and_setup_msc0_memory() const;
 };
 
 #endif //TUNER_HELPER_H

@@ -1,7 +1,3 @@
-//
-// Created by tarek on 10/1/26.
-//
-
 #ifndef AUDIO_PIPE_H
 #define AUDIO_PIPE_H
 

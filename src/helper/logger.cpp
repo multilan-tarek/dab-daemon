@@ -1,7 +1,3 @@
-//
-// Created by tarek on 10/1/26.
-//
-
 #include "logger.h"
 #include <chrono>
 #include <ctime>

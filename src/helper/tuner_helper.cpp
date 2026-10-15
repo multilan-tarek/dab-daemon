@@ -1,8 +1,5 @@
-//
-// Created by tarek on 9/30/26.
-//
-
 #include "tuner_helper.h"
+#include "dab_channels.h"
 #include <algorithm>
 #include <chrono>
 #include <format>
@@ -10,19 +7,130 @@
 #include <thread>
 #include <vector>
 
-TunerHelper::TunerHelper(const int tuner_id, libusb_device_handle *device_handle, const std::function<void(const std::vector<uint8_t> &)> &fic_callback, const std::function<void(const std::vector<uint8_t> &)> &msc_callback) {
+static_assert(DAB_CHANNELS.size() == std::size(TunerHelper::ADC_CLOCK_ENSEMBLE_MAP));
+static_assert(DAB_CHANNELS.size() == std::size(TunerHelper::PLL_NF_ENSEMBLE_MAP));
+
+TunerHelper::Operation::Operation(const TunerHelper &helper, const std::chrono::milliseconds timeout)
+    : helper(helper), previous_active(helper.operation_active), previous_deadline(helper.operation_deadline) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    if (!previous_active) {
+        helper.operation_error = LIBUSB_SUCCESS;
+    }
+
+    helper.operation_deadline = previous_active ? std::min(previous_deadline, deadline) : deadline;
+    helper.operation_active = true;
+}
+
+TunerHelper::Operation::~Operation() {
+    helper.operation_deadline = previous_deadline;
+    helper.operation_active = previous_active;
+}
+
+bool TunerHelper::Operation::succeeded() const {
+    return helper.check_operation() == LIBUSB_SUCCESS;
+}
+
+TunerHelper::Operation TunerHelper::begin_operation(const std::chrono::milliseconds timeout) const {
+    return Operation(*this, timeout);
+}
+
+void TunerHelper::cancel_operations() {
+    operations_cancelled = true;
+}
+
+int TunerHelper::check_operation() const {
+    if (operations_cancelled) {
+        return LIBUSB_ERROR_INTERRUPTED;
+    }
+
+    if (device_lost) {
+        return LIBUSB_ERROR_NO_DEVICE;
+    }
+
+    if (operation_active && operation_error != LIBUSB_SUCCESS) {
+        return operation_error;
+    }
+
+    if (operation_active && std::chrono::steady_clock::now() >= operation_deadline) {
+        record_usb_error(LIBUSB_ERROR_TIMEOUT);
+        return LIBUSB_ERROR_TIMEOUT;
+    }
+
+    return LIBUSB_SUCCESS;
+}
+
+void TunerHelper::record_usb_error(const int error) const {
+    if (operation_active) {
+        operation_error = error;
+    }
+
+    int expected = LIBUSB_SUCCESS;
+    pending_usb_error.compare_exchange_strong(expected, error);
+
+    if (error == LIBUSB_ERROR_NO_DEVICE) {
+        device_lost = true;
+        pending_usb_error = error;
+    }
+
+    const std::lock_guard lock(usb_status_mutex);
+    usb_status.last_error = error;
+    usb_status.last_error_time = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    usb_status.errors++;
+
+    if (error == LIBUSB_ERROR_TIMEOUT) {
+        usb_status.timeouts++;
+    }
+}
+
+TunerHelper::USBStatus TunerHelper::get_usb_status() const {
+    const std::lock_guard lock(usb_status_mutex);
+    return usb_status;
+}
+
+TunerHelper::TunerHelper(const int tuner_id, libusb_device_handle *device_handle, const std::function<void(const std::vector<uint8_t> &)> &fic_callback, const std::function<void(const std::vector<uint8_t> &)> &msc_callback, const std::function<void(const std::vector<uint8_t> &)> &background_msc_callback) {
     logger.set_id(tuner_id);
     this->device_handle = device_handle;
     this->fic_callback = fic_callback;
     this->msc_callback = msc_callback;
+    this->background_msc_callback = background_msc_callback;
 }
 
 int TunerHelper::bulk_transfer(const uint8_t endpoint, std::vector<uint8_t> &buffer) const {
+    const int operation_result = check_operation();
+
+    if (operation_result != LIBUSB_SUCCESS) {
+        return operation_result;
+    }
+
+    unsigned timeout = 1000;
+
+    if (operation_active) {
+        const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(operation_deadline - std::chrono::steady_clock::now());
+        timeout = static_cast<unsigned>(std::clamp<int64_t>(remaining.count(), 1, timeout));
+    }
+
     int transferred = 0;
-    const int result = libusb_bulk_transfer(device_handle, endpoint, buffer.data(), buffer.size(), &transferred, 5000);
+    int result = libusb_bulk_transfer(device_handle, endpoint, buffer.data(), buffer.size(), &transferred, timeout);
+
+    if (operations_cancelled) {
+        return LIBUSB_ERROR_INTERRUPTED;
+    }
+
+    if (result == LIBUSB_SUCCESS && endpoint == ENDPOINT_OUT && transferred != static_cast<int>(buffer.size())) {
+        result = LIBUSB_ERROR_IO;
+    }
 
     if (result != LIBUSB_SUCCESS) {
-        logger.error(std::format("USB bulk transfer on endpoint 0x{:02X} failed: {}", endpoint, libusb_error_name(result)));
+        record_usb_error(result);
+
+        if (result == LIBUSB_ERROR_NO_DEVICE) {
+            logger.warning(std::format("USB device disappeared during transfer on endpoint 0x{:02X}", endpoint));
+        } else if (result != LIBUSB_ERROR_TIMEOUT) {
+            logger.warning(std::format("USB bulk transfer on endpoint 0x{:02X} failed: {}", endpoint, libusb_error_name(result)));
+        }
+
+        return result;
     }
 
     return transferred;
@@ -40,15 +148,28 @@ void TunerHelper::set_register(const uint8_t reg, const uint8_t value) const {
 
 uint8_t TunerHelper::read_register(const uint8_t reg) const {
     std::vector<uint8_t> data{0x22, 0x00, 0x01, 0x00, reg};
-    bulk_transfer(ENDPOINT_OUT, data);
+
+    if (bulk_transfer(ENDPOINT_OUT, data) < 0) {
+        return 0;
+    }
 
     std::vector<uint8_t> read_buffer(5);
-    bulk_transfer(ENDPOINT_IN, read_buffer);
+
+    const int transferred = bulk_transfer(ENDPOINT_IN, read_buffer);
+
+    if (transferred < 5) {
+        if (transferred >= 0) {
+            record_usb_error(LIBUSB_ERROR_IO);
+        }
+
+        return 0;
+    }
 
     return read_buffer[4];
 }
 
 bool TunerHelper::power_up() const {
+    const auto operation = begin_operation(INITIALIZATION_TIMEOUT);
     const auto initialization_start = std::chrono::steady_clock::now();
 
     logger.info("Starting hardware initialization");
@@ -59,6 +180,11 @@ bool TunerHelper::power_up() const {
         set_register(0x7D, 0x06);
 
         if (read_register(0x7D) != 0x06) {
+            if (!operation.succeeded()) {
+                logger.error("Hardware initialization aborted during host communication");
+                return false;
+            }
+
             continue;
         }
 
@@ -71,6 +197,9 @@ bool TunerHelper::power_up() const {
         configure_power_type();
         logger.debug("Configuring ADC clock");
         configure_adc_clock();
+        if (!operation.succeeded()) {
+            return false;
+        }
         logger.debug(std::format("Power and ADC clock configured in {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - phase_start).count()));
 
         phase_start = std::chrono::steady_clock::now();
@@ -85,6 +214,9 @@ bool TunerHelper::power_up() const {
         tdmb_init_of_dm();
         logger.debug("Initializing FEC block");
         tdmb_init_fec();
+        if (!operation.succeeded()) {
+            return false;
+        }
         logger.debug(std::format("DAB baseband initialized in {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - phase_start).count()));
 
         phase_start = std::chrono::steady_clock::now();
@@ -97,6 +229,9 @@ bool TunerHelper::power_up() const {
         stream_disable();
         logger.debug("Configuring host interface");
         configure_host_if();
+        if (!operation.succeeded()) {
+            return false;
+        }
         logger.debug(std::format("Host interface and interrupts configured in {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - phase_start).count()));
 
         phase_start = std::chrono::steady_clock::now();
@@ -105,12 +240,18 @@ bool TunerHelper::power_up() const {
         rf_initialize();
         logger.debug("Running RF special setup");
         rf_special();
+        if (!operation.succeeded()) {
+            return false;
+        }
         logger.debug(std::format("RF frontend initialized in {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - phase_start).count()));
 
         phase_start = std::chrono::steady_clock::now();
         logger.info("Configuring FIC and MSC buffers");
         setup_msc_threshold();
         setup_memory_fic();
+        if (!operation.succeeded()) {
+            return false;
+        }
         logger.debug(std::format("FIC and MSC buffers configured in {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - phase_start).count()));
 
         logger.info(std::format("Hardware initialization complete in {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - initialization_start).count()));
@@ -664,28 +805,15 @@ void TunerHelper::setup_memory_fic() const {
 }
 
 bool TunerHelper::set_frequency(const uint32_t frequency) {
-    if (frequency < FREQ_START) {
-        logger.warning(std::format("Frequency {} kHz is below Band III", frequency));
+    const auto operation = begin_operation(TUNING_TIMEOUT);
+    const auto channel_index = get_dab_channel_index(frequency);
+
+    if (!channel_index.has_value()) {
+        logger.warning(std::format("Frequency {} kHz is not a supported Band III channel", frequency));
         return false;
     }
 
-    int index = static_cast<int>((frequency - FREQ_START) / FREQ_STEP);
-
-    if (frequency >= 224096) {
-        index += 3;
-    } else if (frequency >= 217088) {
-        index += 2;
-    } else if (frequency >= 210096) {
-        index += 1;
-    }
-
-    constexpr size_t table_size = std::size(ADC_CLOCK_ENSEMBLE_MAP);
-
-    if (index < 0 || static_cast<size_t>(index) >= table_size) {
-        logger.warning(std::format("Frequency {} kHz is outside the supported Band III table", frequency));
-        return false;
-    }
-
+    const size_t index = *channel_index;
     const uint8_t adc_clock_type = ADC_CLOCK_ENSEMBLE_MAP[index];
 
     if (!changed_adc_clock(adc_clock_type)) {
@@ -702,37 +830,38 @@ bool TunerHelper::set_frequency(const uint32_t frequency) {
     set_register(0x25, static_cast<uint8_t>(pll_nf >> 5 & 0xFF));
     set_register(0x26, static_cast<uint8_t>((pll_nf & 0x3F) << 2 | 0x01));
 
+    const auto pll_start = std::chrono::steady_clock::now();
+    const auto pll_deadline = pll_start + std::chrono::milliseconds(PLL_TIMEOUT_MS);
     std::this_thread::sleep_for(std::chrono::milliseconds(PLL_MIN_SETTLE_MS));
 
-    unsigned waited_ms = PLL_MIN_SETTLE_MS;
     bool pll_locked = (read_register(0x15) & 0x02) != 0;
 
-    while (!pll_locked && waited_ms < PLL_TIMEOUT_MS) {
-        const unsigned wait_ms = std::min(PLL_POLL_MS, PLL_TIMEOUT_MS - waited_ms);
-        std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-        waited_ms += wait_ms;
+    while (!pll_locked && operation.succeeded() && std::chrono::steady_clock::now() < pll_deadline) {
+        std::this_thread::sleep_until(std::min(pll_deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(PLL_POLL_MS)));
         pll_locked = (read_register(0x15) & 0x02) != 0;
     }
 
     set_register(0x20, 0x00);
 
-    if (!pll_locked) {
+    if (!pll_locked || !operation.succeeded()) {
         logger.warning(std::format("RF PLL did not lock within {} ms", PLL_TIMEOUT_MS));
         return false;
     }
 
-    logger.debug(std::format("RF PLL locked after {} ms", waited_ms));
+    logger.debug(std::format("RF PLL locked after {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - pll_start).count()));
 
     switch_page(REGISTER_PAGE_FM);
     set_register(0x10, 0x48);
     set_register(0x10, 0xC9);
 
     current_subchannel = 0xFF;
+    close_background_subchannel();
     logger.debug(std::format("RF tuned to {} kHz", frequency));
-    return true;
+    return operation.succeeded();
 }
 
 void TunerHelper::open_subchannel(const uint8_t subchannel) {
+    const auto operation = begin_operation(RECEIVE_TIMEOUT);
     if (current_subchannel == subchannel) {
         return;
     }
@@ -745,13 +874,56 @@ void TunerHelper::open_subchannel(const uint8_t subchannel) {
 
     switch_page(REGISTER_PAGE_DD);
     set_register(0x3A, static_cast<uint8_t>(0x80 | subchannel));
-    current_subchannel = subchannel;
-
     clear_and_setup_msc_memory();
+
+    if (!operation.succeeded()) {
+        current_subchannel = 0xFF;
+        return;
+    }
+
+    current_subchannel = subchannel;
     logger.debug(std::format("MSC subchannel set to {}", subchannel));
 }
 
+void TunerHelper::open_background_subchannel(const uint8_t subchannel) {
+    const auto operation = begin_operation(RECEIVE_TIMEOUT);
+    if (background_subchannel == subchannel) {
+        return;
+    }
+
+    switch_page(REGISTER_PAGE_DD);
+    set_register(0x47, 0x00);
+    set_register(0x31, static_cast<uint8_t>(read_register(0x31) & ~0x03));
+    set_register(0x3D, static_cast<uint8_t>(0x80 | subchannel));
+    set_register(0x50, 0x02);
+    set_register(0x51, 0x00);
+    set_register(INT_E_UCLRL, 0x02);
+    clear_and_setup_msc0_memory();
+
+    if (!operation.succeeded()) {
+        background_subchannel = 0xFF;
+        return;
+    }
+
+    background_subchannel = subchannel;
+    logger.debug(std::format("Background MSC subchannel set to {}", subchannel));
+}
+
+void TunerHelper::close_background_subchannel() {
+    const auto operation = begin_operation(RECEIVE_TIMEOUT);
+    if (background_subchannel == 0xFF) {
+        return;
+    }
+
+    switch_page(REGISTER_PAGE_DD);
+    set_register(0x3D, 0x00);
+    set_register(0x47, 0x00);
+    set_register(INT_E_UCLRL, 0x02);
+    background_subchannel = 0xFF;
+}
+
 void TunerHelper::read_data() const {
+    const auto operation = begin_operation(RECEIVE_TIMEOUT);
     switch_page(REGISTER_PAGE_DD);
 
     const uint8_t interrupt_status = read_register(INT_E_STATL);
@@ -759,6 +931,9 @@ void TunerHelper::read_data() const {
     const bool msc1_underrun = (interrupt_status & MSC1_E_UNDER_FLOW) != 0;
     const bool msc1_interrupt = (interrupt_status & MSC1_E_INT) != 0;
     const bool fic_interrupt = (interrupt_status & FIC_E_INT) != 0;
+    const bool msc0_overrun = (interrupt_status & MSC0_E_OVER_FLOW) != 0;
+    const bool msc0_underrun = (interrupt_status & MSC0_E_UNDER_FLOW) != 0;
+    const bool msc0_interrupt = (interrupt_status & MSC0_E_INT) != 0;
 
     if (fic_interrupt) {
         switch_page(REGISTER_PAGE_FIC);
@@ -787,10 +962,7 @@ void TunerHelper::read_data() const {
         }
 
         clear_and_setup_msc_memory();
-        return;
-    }
-
-    if (msc1_interrupt) {
+    } else if (msc1_interrupt) {
         switch_page(REGISTER_PAGE_MSC1);
 
         std::vector<uint8_t> request{0x22, 0x00, 0x00, 0x08, 0x10};
@@ -807,10 +979,85 @@ void TunerHelper::read_data() const {
         set_register(INT_E_UCLRL, 0x04);
     }
 
+    if (background_subchannel != 0xFF) {
+        if (msc0_overrun || msc0_underrun) {
+            logger.warning(msc0_overrun ? "MSC0 memory overrun" : "MSC0 memory underrun");
+            clear_and_setup_msc0_memory();
+            set_register(INT_E_UCLRL, 0x02);
+        } else if (msc0_interrupt) {
+            switch_page(REGISTER_PAGE_MSC0);
+
+            std::vector<uint8_t> request{0x22, 0x00, 0x00, 0x02, 0x10};
+            bulk_transfer(ENDPOINT_OUT, request);
+
+            std::vector<uint8_t> response(1024);
+            const int transferred = bulk_transfer(ENDPOINT_IN, response);
+
+            if (background_msc_callback && transferred >= 4) {
+                background_msc_callback(std::vector(response.begin() + 4, response.begin() + transferred));
+            }
+
+            switch_page(REGISTER_PAGE_DD);
+            set_register(INT_E_UCLRL, 0x02);
+        }
+    }
+}
+
+int TunerHelper::take_usb_error() const {
+    return pending_usb_error.exchange(LIBUSB_SUCCESS);
+}
+
+TunerHelper::SignalStatus TunerHelper::get_signal_status() const {
+    const auto operation = begin_operation(RECEIVE_TIMEOUT);
+    SignalStatus status;
+
+    switch_page(REGISTER_PAGE_DD);
+
+    status.ofdm_lock = (read_register(0x37) & 0x01) != 0;
+    status.fec_lock = (read_register(0xFB) & 0x03) == 0x03;
+    status.fec_sync = ((read_register(0xD7) >> 4) & 0x01) != 0;
+
+    if (!status.ofdm_lock) {
+        return status;
+    }
+
+    const uint32_t period = static_cast<uint32_t>(read_register(0x88)) << 24
+        | static_cast<uint32_t>(read_register(0x89)) << 16
+        | static_cast<uint32_t>(read_register(0x8A)) << 8
+        | read_register(0x8B);
+    const uint32_t errors = static_cast<uint32_t>(read_register(0x8C)) << 24
+        | static_cast<uint32_t>(read_register(0x8D)) << 16
+        | static_cast<uint32_t>(read_register(0x8E)) << 8
+        | read_register(0x8F);
+
+    if (period == 0 || !status.fec_sync) {
+        return status;
+    }
+
+    status.msc_cer_valid = true;
+    status.msc_cer = static_cast<uint32_t>(std::min<uint64_t>(10000, static_cast<uint64_t>(errors) * 10000 / period));
+
+    uint32_t antenna_cer = errors <= 4000 ? 0 : status.msc_cer;
+
+    if (antenna_cer > 1200) {
+        antenna_cer = 2000;
+    }
+
+    while (static_cast<size_t>(status.antenna_level) + 1 < DAB_ANTENNA_LEVEL_CER_THRESHOLDS.size() && antenna_cer < DAB_ANTENNA_LEVEL_CER_THRESHOLDS[status.antenna_level]) {
+        status.antenna_level++;
+    }
+
+    return status;
 }
 
 void TunerHelper::clear_and_setup_msc_memory() const {
     switch_page(REGISTER_PAGE_DD);
     set_register(0x48, 0x00);
     set_register(0x48, 0x05);
+}
+
+void TunerHelper::clear_and_setup_msc0_memory() const {
+    switch_page(REGISTER_PAGE_DD);
+    set_register(0x47, 0x00);
+    set_register(0x47, 0x05);
 }

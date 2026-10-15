@@ -1,7 +1,3 @@
-//
-// Created by tarek on 10/1/26.
-//
-
 #ifndef DYNAMIC_LABEL_DECODER_H
 #define DYNAMIC_LABEL_DECODER_H
 

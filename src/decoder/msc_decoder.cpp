@@ -1,7 +1,3 @@
-//
-// Created by tarek on 10/1/26.
-//
-
 /*
  * Portions of this file are derived from the IRT DAB library.
  * Copyright (C) 2018 IRT GmbH, Fabian Sattler.
@@ -18,6 +14,7 @@ extern "C" {
 MSCDecoder::MSCDecoder(const std::function<void(const AccessUnit &)> &access_unit_callback, const PADCallback &pad_callback) {
     this->access_unit_callback = access_unit_callback;
     this->pad_callback = pad_callback;
+    reset();
 }
 
 void MSCDecoder::Superframe::clear() {
@@ -42,11 +39,13 @@ MSCDecoder::ReedSolomonDecoder::~ReedSolomonDecoder() {
     free_rs_char(handle);
 }
 
-void MSCDecoder::ReedSolomonDecoder::decode(std::vector<uint8_t> &data) {
+std::pair<uint32_t, uint32_t> MSCDecoder::ReedSolomonDecoder::decode(std::vector<uint8_t> &data) {
     const int subchannel_index = static_cast<int>(data.size() / 120);
+    uint32_t corrected = 0;
+    uint32_t uncorrectable = 0;
 
     if (subchannel_index == 0) {
-        return;
+        return {0, 0};
     }
 
     for (int packet_index = 0; packet_index < subchannel_index; packet_index++) {
@@ -56,18 +55,27 @@ void MSCDecoder::ReedSolomonDecoder::decode(std::vector<uint8_t> &data) {
 
         const int correction_count = decode_rs_char(handle, packet, correction_positions, 0);
 
-        if (correction_count <= 0) {
+        if (correction_count < 0) {
+            uncorrectable++;
+            continue;
+        }
+
+        corrected += correction_count;
+
+        if (correction_count == 0) {
             continue;
         }
 
         for (int correction = 0; correction < correction_count; correction++) {
             const int position = correction_positions[correction] - 135;
 
-            if (position >= 0) {
+            if (position >= 0 && position < 120) {
                 data[position * subchannel_index + packet_index] = packet[position];
             }
         }
     }
+
+    return {corrected, uncorrectable};
 }
 
 void MSCDecoder::reset() {
@@ -77,7 +85,19 @@ void MSCDecoder::reset() {
     input_buffer.clear();
     frame_alignment_valid = false;
     aligned_frame_count = 0;
+#if DAB_ENABLE_DIAGNOSTICS
+    statistics = {};
+    statistics.rs_available = true;
+    statistics.crc_available = true;
+#endif
 }
+
+#if DAB_ENABLE_DIAGNOSTICS
+AudioStatistics MSCDecoder::get_statistics() {
+    statistics.check_gap();
+    return statistics;
+}
+#endif
 
 void MSCDecoder::set_bitrate(const uint16_t bitrate) {
     frame_size = static_cast<uint16_t>(bitrate * 3);
@@ -119,6 +139,9 @@ void MSCDecoder::synchronize(const std::vector<uint8_t> &data) {
         const uint8_t *frame = buffer.data() + offset;
 
         if ((frame[0] != 0 || frame[1] != 0) && check_firecode(frame)) {
+#if DAB_ENABLE_DIAGNOSTICS
+            statistics.synchronized = true;
+#endif
             process_frame(std::vector(buffer.begin() + offset, buffer.begin() + offset + frame_size));
             offset += frame_size;
             frame_alignment_valid = true;
@@ -126,6 +149,9 @@ void MSCDecoder::synchronize(const std::vector<uint8_t> &data) {
             continue;
         }
 
+#if DAB_ENABLE_DIAGNOSTICS
+        statistics.record_sync_loss();
+#endif
         offset++;
     }
 
@@ -135,6 +161,9 @@ void MSCDecoder::synchronize(const std::vector<uint8_t> &data) {
 void MSCDecoder::process_frame(const std::vector<uint8_t> &frame) {
     if (superframe_frame_count == 0) {
         if (!start_superframe(frame)) {
+#if DAB_ENABLE_DIAGNOSTICS
+            statistics.record_sync_loss();
+#endif
             return;
         }
 
@@ -213,19 +242,40 @@ bool MSCDecoder::start_superframe(const std::vector<uint8_t> &frame) {
 }
 
 void MSCDecoder::finish_superframe() {
-    reed_solomon_decoder.decode(current_superframe.data);
+    const auto [corrected, uncorrectable] = reed_solomon_decoder.decode(current_superframe.data);
+#if DAB_ENABLE_DIAGNOSTICS
+    statistics.rs_corrected += corrected;
+    statistics.rs_uncorrectable += uncorrectable;
+    statistics.sampling_rate = current_superframe.sampling_rate;
+    statistics.channels = current_superframe.channels;
+    statistics.sbr = current_superframe.sbr;
+#endif
 
     if (current_superframe.data.size() < superframe_size) {
         return;
     }
 
     for (uint8_t index = 0; index < current_superframe.access_unit_count; index++) {
+#if DAB_ENABLE_DIAGNOSTICS
+        statistics.frames_received++;
+#endif
         emit_access_unit(current_superframe.access_unit_starts[index], current_superframe.access_unit_lengths[index]);
     }
 }
 
 void MSCDecoder::emit_access_unit(const uint16_t start, const uint16_t length) {
-    if (length < 2 || start + length > current_superframe.data.size() || !check_crc(current_superframe.data.data() + start, length)) {
+    if (length < 2 || start + length > current_superframe.data.size()) {
+#if DAB_ENABLE_DIAGNOSTICS
+        statistics.record_discard();
+#endif
+        return;
+    }
+
+    if (!check_crc(current_superframe.data.data() + start, length)) {
+#if DAB_ENABLE_DIAGNOSTICS
+        statistics.crc_errors++;
+        statistics.record_discard();
+#endif
         return;
     }
 
@@ -256,7 +306,14 @@ void MSCDecoder::emit_access_unit(const uint16_t start, const uint16_t length) {
         }
     }
 
-    if (payload_length == 0 || access_unit_callback == nullptr) {
+    if (payload_length == 0) {
+#if DAB_ENABLE_DIAGNOSTICS
+        statistics.record_discard();
+#endif
+        return;
+    }
+
+    if (access_unit_callback == nullptr) {
         return;
     }
 
@@ -265,6 +322,9 @@ void MSCDecoder::emit_access_unit(const uint16_t start, const uint16_t length) {
     access_unit.sampling_rate = current_superframe.sampling_rate;
     access_unit.channels = current_superframe.channels;
     access_unit.sbr = current_superframe.sbr;
+#if DAB_ENABLE_DIAGNOSTICS
+    statistics.record_output();
+#endif
     access_unit_callback(access_unit);
 }
 

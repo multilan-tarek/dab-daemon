@@ -1,12 +1,11 @@
-//
-// Created by tarek on 9/30/26.
-//
-
 #ifndef USB_HANDLER_H
 #define USB_HANDLER_H
 
 #include <functional>
 #include <libusb-1.0/libusb.h>
+#include <mutex>
+#include <utility>
+#include <vector>
 #include "../helper/logger.h"
 
 class USBHandler {
@@ -26,17 +25,22 @@ public:
 
     void init();
 
-    void handle() const;
+    void handle();
 
     libusb_device_handle *get_device_handle(Device device) const;
 
 private:
     libusb_context *context = nullptr;
     libusb_hotplug_callback_handle callback_handle{};
+    bool hotplug_registered = false;
+    std::vector<std::pair<Device, libusb_hotplug_event>> pending_events;
+    std::mutex pending_events_mutex;
 
     std::function<void(Device)> connect_callback = nullptr;
     std::function<void(Device)> disconnect_callback = nullptr;
     Logger logger{"USB"};
+
+    void dispatch_hotplug_events();
 
     static int hotplug_callback(libusb_context *, libusb_device *device, libusb_hotplug_event event, void *obj);
 };
