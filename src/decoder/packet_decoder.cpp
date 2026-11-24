@@ -230,14 +230,7 @@ bool PacketDecoder::is_fec_packet_set(const uint8_t *data, const size_t length) 
         }
     }
 
-    const uint8_t *last_packet = data + (FEC_PACKET_COUNT - 1) * FEC_PACKET_SIZE;
-
-    for (size_t offset = 18; offset < FEC_PACKET_SIZE; offset++) {
-        if (last_packet[offset] != 0) {
-            return false;
-        }
-    }
-
+    // Ignore the unused tail; RS and packet CRC checks validate the protected data.
     return true;
 }
 

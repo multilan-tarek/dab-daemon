@@ -39,6 +39,7 @@
 #endif
 #if DAB_ENABLE_TPEG
 #include "../decoder/tpeg_decoder.h"
+#include "../decoder/tpeg_content_decoder.h"
 #endif
 #if DAB_ENABLE_SLIDESHOW
 #include "../decoder/slideshow_decoder.h"
@@ -46,6 +47,7 @@
 #endif
 #if DAB_ENABLE_AUDIO
 #include "../helper/audio_pipe.h"
+#include "../helper/audio_mute.h"
 #endif
 #include "../helper/dab_channels.h"
 #include "../helper/signal_quality_filter.h"
@@ -293,6 +295,8 @@ public:
 
     std::vector<SPIDecoder::ProgrammeGroup> get_programme_groups() const;
 
+    std::vector<SPIDecoder::Programme> get_group_programmes(const std::string &group_id, uint32_t short_id) const;
+
     std::vector<SPIAsset> get_spi_assets() const;
 
     std::vector<ServiceLogo> get_service_logos() const;
@@ -329,6 +333,12 @@ public:
 
     TPEGDecoder::Status get_tpeg_status() const;
 
+    TPEGContentDecoder::Status get_tpeg_content_status() const;
+
+    std::vector<TPEGContentDecoder::Service> get_tpeg_service_information() const;
+
+    std::vector<TPEGContentDecoder::Message> get_tpeg_messages() const;
+
     std::vector<TPEGDecoder::ServiceIdentifier> get_tpeg_services() const;
 
     std::vector<TPEGDecoder::Frame> get_tpeg_frames(uint64_t since_sequence, uint16_t limit) const;
@@ -341,11 +351,19 @@ public:
 
     std::string get_scan_mode() const;
 
+    std::vector<std::string> get_scan_modes() const;
+
     ScanProgress get_scan_progress() const;
 
     std::vector<ScanResult> get_scan_results() const;
 
     bool start_scan(const std::string &mode);
+
+    bool seek_up();
+
+    bool seek_down();
+
+    bool stop_seek();
 
     bool stop_scan();
 #endif
@@ -379,7 +397,16 @@ private:
     enum class ScanMode {
         None,
         Fast,
-        Full
+        Full,
+        SeekUp,
+        SeekDown
+    };
+
+    enum class ScanOutcome {
+        Completed,
+        Cancelled,
+        NotFound,
+        Failed
     };
 
     enum class ScanPhase {
@@ -426,6 +453,7 @@ private:
 #endif
 #if DAB_ENABLE_AUDIO
     AudioPipe *audio_pipe = nullptr;
+    AudioMute audio_mute;
 #endif
 #if DAB_ENABLE_SLIDESHOW
     SlideShowFile *slideshow_file = nullptr;
@@ -532,6 +560,7 @@ private:
 #endif
 #if DAB_ENABLE_TPEG
     TPEGDecoder::Status tpeg_status;
+    TPEGContentDecoder tpeg_content_decoder;
     bool tpeg_suppressed = false;
     std::vector<TPEGDecoder::ServiceIdentifier> tpeg_services;
     std::vector<TPEGDecoder::Frame> tpeg_frames;
@@ -559,6 +588,7 @@ private:
     ScanProgress scan_progress;
     std::vector<ScanResult> scan_results;
     size_t scan_channel_index = 0;
+    size_t scan_channels_checked = 0;
     uint32_t scan_saved_frequency = 0;
     uint16_t scan_saved_service_id = 0;
     uint16_t scan_restore_service_id = 0;
@@ -567,6 +597,10 @@ private:
     std::chrono::steady_clock::time_point scan_last_service_change;
     std::chrono::steady_clock::time_point scan_restore_deadline;
     bool scan_ensemble_seen_valid = false;
+#if DAB_ENABLE_FULL_SCAN
+    bool scan_service_information_complete = false;
+    bool scan_tune_retried = false;
+#endif
 #endif
 
     bool fic_data_received = false;
@@ -592,7 +626,11 @@ private:
 #if DAB_ENABLE_SCAN
     void scan_step();
 
-    void finish_scan(bool cancelled);
+    bool start_scan_mode(ScanMode mode);
+
+    bool stop_scan_mode(bool seek_only);
+
+    void finish_scan(ScanOutcome outcome);
 
     void capture_scan_result();
 

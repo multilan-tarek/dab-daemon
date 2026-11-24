@@ -59,6 +59,10 @@ using DBusTPEGStatus = sdbus::Struct<uint64_t, uint64_t, uint64_t, uint64_t, uin
 using DBusTPEGServiceIdentifier = sdbus::Struct<uint8_t, uint8_t, uint8_t>;
 using DBusTPEGComponent = sdbus::Struct<uint8_t, uint16_t, std::vector<uint8_t>>;
 using DBusTPEGFrame = sdbus::Struct<uint64_t, uint8_t, DBusTPEGServiceIdentifier, uint8_t, std::vector<DBusTPEGComponent>, std::vector<uint8_t>>;
+using DBusTPEGApplication = sdbus::Struct<uint8_t, uint8_t, uint16_t, uint8_t, uint8_t, uint32_t, uint8_t, std::string>;
+using DBusTPEGServiceInformation = sdbus::Struct<DBusTPEGServiceIdentifier, std::string, std::string, uint8_t, uint8_t, std::vector<DBusTPEGApplication>>;
+using DBusTPEGField = sdbus::Struct<std::string, std::string, std::string>;
+using DBusTPEGMessage = sdbus::Struct<DBusTPEGServiceIdentifier, uint8_t, uint16_t, uint32_t, uint8_t, uint32_t, uint32_t, bool, uint8_t, uint64_t, std::string, std::vector<DBusTPEGField>, std::vector<uint8_t>>;
 #endif
 
 
@@ -103,7 +107,7 @@ DBusSPIProgramme make_dbus_spi_programme(const SPIDecoder::Programme &programme)
 }
 
 DBusSPIProgrammeGroup make_dbus_spi_programme_group(const SPIDecoder::ProgrammeGroup &group) {
-    return make_dbus_struct(group.id, group.short_id, group.short_name, group.medium_name, group.long_name, group.short_description, group.long_description, group.genres, make_dbus_spi_multimedia(group.multimedia));
+    return make_dbus_struct(group.id, group.short_id <= 0xFFFFFF ? group.short_id : 0, group.short_name, group.medium_name, group.long_name, group.short_description, group.long_description, group.genres, make_dbus_spi_multimedia(group.multimedia));
 }
 #endif
 
@@ -265,7 +269,7 @@ std::string_view interface_for_property(const std::string_view property) {
 #endif
 
 #if DAB_ENABLE_SCAN
-    if (property == "ScanState" || property == "ScanMode" || property == "ScanProgress" || property == "ScanResults") {
+    if (property == "ScanState" || property == "ScanMode" || property == "ScanModes" || property == "ScanProgress" || property == "ScanResults") {
         return SCAN_INTERFACE;
     }
 #endif
@@ -352,7 +356,7 @@ bool property_was_compiled_out(const std::string_view property) {
     }
 #endif
 #if !DAB_ENABLE_SCAN
-    if (property == "ScanState" || property == "ScanMode" || property == "ScanProgress" || property == "ScanResults") {
+    if (property == "ScanState" || property == "ScanMode" || property == "ScanModes" || property == "ScanProgress" || property == "ScanResults") {
         return true;
     }
 #endif
@@ -599,6 +603,15 @@ DBusHandler::DBusHandler(const int id, const std::unique_ptr<sdbus::IConnection>
             }
 
             return result;
+        }),
+        sdbus::registerMethod("GetGroupProgrammes").withInputParamNames("group_id", "short_id").withOutputParamNames("programmes").implementedAs([this](const std::string &group_id, const uint32_t short_id) {
+            std::vector<DBusSPIProgramme> result;
+
+            for (const auto &programme: this->tuner_handler->get_group_programmes(group_id, short_id)) {
+                result.emplace_back(make_dbus_spi_programme(programme));
+            }
+
+            return result;
         })
     ).forInterface(std::string(SPI_INTERFACE));
 #endif
@@ -657,6 +670,40 @@ DBusHandler::DBusHandler(const int id, const std::unique_ptr<sdbus::IConnection>
 
             for (const auto &service: this->tuner_handler->get_tpeg_services()) {
                 result.emplace_back(make_dbus_struct(service.a, service.b, service.c));
+            }
+
+            return result;
+        }),
+        sdbus::registerMethod("GetTPEGContentStatus").withOutputParamNames("status").implementedAs([this]() {
+            const auto status = this->tuner_handler->get_tpeg_content_status();
+            return make_dbus_struct(status.messages_received, status.data_crc_errors, status.malformed_components, status.unsupported_components);
+        }),
+        sdbus::registerMethod("GetTPEGServiceInformation").withOutputParamNames("services").implementedAs([this]() {
+            std::vector<DBusTPEGServiceInformation> result;
+
+            for (const auto &service: this->tuner_handler->get_tpeg_service_information()) {
+                std::vector<DBusTPEGApplication> applications;
+
+                for (const auto &application: service.applications) {
+                    applications.emplace_back(make_dbus_struct(application.component_id, application.content_id, application.id, application.major_version, application.minor_version, application.message_count, application.encryption, application.description));
+                }
+
+                result.emplace_back(make_dbus_struct(make_dbus_struct(service.id.a, service.id.b, service.id.c), service.name, service.description, service.table_version, service.character_encoding, applications));
+            }
+
+            return result;
+        }),
+        sdbus::registerMethod("GetTPEGMessages").withOutputParamNames("messages").implementedAs([this]() {
+            std::vector<DBusTPEGMessage> result;
+
+            for (const auto &message: this->tuner_handler->get_tpeg_messages()) {
+                std::vector<DBusTPEGField> fields;
+
+                for (const auto &field: message.fields) {
+                    fields.emplace_back(make_dbus_struct(field.component, field.name, field.value));
+                }
+
+                result.emplace_back(make_dbus_struct(make_dbus_struct(message.service.a, message.service.b, message.service.c), message.component_id, message.application_id, message.id, message.version, message.expiry, message.generation_time, message.cancelled, message.priority, message.sequence, message.summary, fields, message.data));
             }
 
             return result;
@@ -800,6 +847,9 @@ DBusHandler::DBusHandler(const int id, const std::unique_ptr<sdbus::IConnection>
         sdbus::registerProperty("ScanMode").withGetter([this]() {
             return this->tuner_handler->get_scan_mode();
         }),
+        sdbus::registerProperty("ScanModes").withGetter([this]() {
+            return this->tuner_handler->get_scan_modes();
+        }).withUpdateBehavior(sdbus::Flags::CONST_PROPERTY_VALUE),
         sdbus::registerProperty("ScanProgress").withGetter([this]() {
             const auto progress = this->tuner_handler->get_scan_progress();
             return make_dbus_struct(progress.current, progress.total, progress.channel, progress.frequency);
@@ -826,6 +876,26 @@ DBusHandler::DBusHandler(const int id, const std::unique_ptr<sdbus::IConnection>
                 return this->tuner_handler->start_scan(mode);
             });
         }),
+#if DAB_ENABLE_SEEK
+        sdbus::registerMethod("SeekUp").withOutputParamNames("success").implementedAs([this](sdbus::Result<bool> result) {
+            logger.debug("SeekUp()");
+            queue_command(std::move(result), [this]() {
+                return this->tuner_handler->seek_up();
+            });
+        }),
+        sdbus::registerMethod("SeekDown").withOutputParamNames("success").implementedAs([this](sdbus::Result<bool> result) {
+            logger.debug("SeekDown()");
+            queue_command(std::move(result), [this]() {
+                return this->tuner_handler->seek_down();
+            });
+        }),
+        sdbus::registerMethod("StopSeek").withOutputParamNames("success").implementedAs([this](sdbus::Result<bool> result) {
+            logger.debug("StopSeek()");
+            queue_command(std::move(result), [this]() {
+                return this->tuner_handler->stop_seek();
+            });
+        }),
+#endif
         sdbus::registerMethod("StopScan").withOutputParamNames("success").implementedAs([this](sdbus::Result<bool> result) {
             logger.debug("StopScan()");
             queue_command(std::move(result), [this]() {

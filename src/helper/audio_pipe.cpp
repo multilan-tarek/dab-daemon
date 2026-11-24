@@ -1,4 +1,5 @@
 #include "audio_pipe.h"
+#include <array>
 #include <cerrno>
 #include <filesystem>
 #include <format>
@@ -59,6 +60,23 @@ void AudioPipe::write(const std::vector<uint8_t> &data) {
         close();
         return;
     }
+}
+
+void AudioPipe::discard_buffered() {
+    const int reader = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (reader < 0) {
+        return;
+    }
+
+    std::array<uint8_t, 4096> buffer{};
+    while (true) {
+        const auto received = ::read(reader, buffer.data(), buffer.size());
+        if (received > 0 || (received < 0 && errno == EINTR)) {
+            continue;
+        }
+        break;
+    }
+    ::close(reader);
 }
 
 void AudioPipe::close() {

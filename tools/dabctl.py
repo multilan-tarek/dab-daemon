@@ -5,7 +5,7 @@ import os
 import re
 import shutil
 import sys
-from datetime import date, datetime, time as datetime_time, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from html import escape
 from pathlib import Path
 from time import monotonic
@@ -54,6 +54,10 @@ MAX_LOGO_REQUESTS = 8
 MAX_FIC_FIGURES = 2048
 MAX_JOURNALINE_HISTORY = 128
 SCAN_TUNE_TIMEOUT = 5
+AUDIO_CHANGE_ACTIONS = {
+    "select_tuner", "set_frequency", "set_ensemble", "set_service",
+    "close_service", "start_scan", "seek", "tune_scan_result",
+}
 
 TUNER_INTERFACES = (
     TUNER_INTERFACE,
@@ -94,6 +98,8 @@ def mpv_arguments(audio_pipe, audio_codec):
         "--really-quiet",
         "--no-terminal",
         "--cache=no",
+        # Smooth the first 15 ms of decoded audio, starting with the first sample.
+        "--af-add=lavfi=[afade=t=in:st=0:d=0.015:curve=hsin]",
         f"--demuxer-lavf-format={demuxer}",
         audio_pipe,
     ]
@@ -345,6 +351,33 @@ def format_tpeg_frame(frame):
         ],
         "data": list(data),
     }
+
+
+def tpeg_application_name(application_id):
+    return {0: "SNI", 5: "TEC", 7: "TFP"}.get(application_id, f"0x{application_id:04X}")
+
+
+def format_tpeg_message(message):
+    service, component, application, message_id, version, expiry, generation, cancelled, priority, sequence, summary, fields, data = message
+    return {
+        "service": format_tpeg_service(service), "component": component,
+        "application": application, "id": message_id, "version": version,
+        "expiry": expiry, "generation": generation, "cancelled": cancelled,
+        "priority": priority, "sequence": sequence, "summary": summary,
+        "fields": [list(field) for field in fields], "data": bytes(data),
+    }
+
+
+def tpeg_message_key(message):
+    return message["service"], message["component"], message["id"]
+
+
+def tpeg_message_state(message, now=None):
+    if message["cancelled"]:
+        return "Cancelled"
+    if message["expiry"] <= (datetime.now(timezone.utc).timestamp() if now is None else now):
+        return "Expired"
+    return "Active"
 
 
 def format_service(service):
@@ -628,6 +661,7 @@ def status_from_properties(properties):
         "fic_revision": properties.get("FICRevision"),
         "scan_state": properties.get("ScanState", "Idle"),
         "scan_mode": properties.get("ScanMode", ""),
+        "scan_modes": list(properties.get("ScanModes", ["fast", "full"])),
         "scan_progress": {
             "current": scan_progress[0],
             "total": scan_progress[1],
@@ -1084,6 +1118,34 @@ def epg_programme_key(programme):
     )
 
 
+def programme_detail_text(programme, service_name):
+    start = programme_effective_start(programme) or "-"
+    lines = [
+        programme_title(programme),
+        f"Service: {service_name}",
+        f"Time: {start} · {format_duration(programme_effective_duration(programme))}",
+    ]
+
+    if programme.get("actual_time") and programme.get("start_time") and programme["actual_time"] != programme["start_time"]:
+        lines.append(f'Scheduled: {programme["start_time"]} · {format_duration(programme.get("duration", 0))}')
+
+    if programme.get("language"):
+        lines.append(f'Language: {programme["language"]}')
+    if programme.get("genres"):
+        lines.append(f'Genre: {", ".join(programme["genres"])}')
+
+    lines.append(f'Programme ID: {programme.get("id") or programme.get("short_id") or "-"}')
+    description = programme_description(programme)
+    if description != "-":
+        lines.extend(["", description])
+
+    media = [item.get("path") or item.get("url") for item in programme.get("multimedia", []) if item.get("path") or item.get("url")]
+    if media:
+        lines.extend(["", "Media:", *media])
+
+    return "\n".join(lines)
+
+
 def summarize_tpeg_errors(status):
     return status["group_crc_errors"] + status["transport_crc_errors"] + status["directory_crc_errors"] + status["component_crc_errors"] + status["continuity_errors"] + status["malformed_frames"]
 
@@ -1161,12 +1223,15 @@ if QT_AVAILABLE:
 
     class DABWorker(QThread):
         status_changed = pyqtSignal(object, object)
+        audio_change_started = pyqtSignal(int)
+        audio_change_finished = pyqtSignal(int, bool)
         tuner_list_changed = pyqtSignal(object)
         tuner_changed = pyqtSignal(str)
         interfaces_changed = pyqtSignal(object)
         message = pyqtSignal(str)
         connected_changed = pyqtSignal(bool)
         spi_loaded = pyqtSignal(object)
+        spi_group_loaded = pyqtSignal(object)
         journaline_loaded = pyqtSignal(object)
         journaline_object_loaded = pyqtSignal(object)
         tpeg_loaded = pyqtSignal(object)
@@ -1191,6 +1256,7 @@ if QT_AVAILABLE:
             self.status_cache = None
             self.scan_tune_task = None
             self.scan_tune_target = None
+            self.audio_change_sequence = 0
 
         def run(self):
             self.loop = asyncio.new_event_loop()
@@ -1211,30 +1277,72 @@ if QT_AVAILABLE:
             if self.loop is None or not self.loop.is_running():
                 return
 
+            change_id = None
+            if action in AUDIO_CHANGE_ACTIONS:
+                self.audio_change_sequence += 1
+                change_id = self.audio_change_sequence
+                # Emitted in the GUI thread, before the D-Bus request is queued.
+                self.audio_change_started.emit(change_id)
+
+            def track_audio_change(task):
+                if change_id is not None:
+                    # A done callback also runs if a scan tune is cancelled before starting.
+                    task.add_done_callback(lambda _: asyncio.create_task(self._complete_audio_change(change_id)))
+
             def schedule():
                 method = getattr(self, f"_action_{action}", None)
                 if method is None:
                     self.message.emit(f"Unknown action: {action}")
+                    if change_id is not None:
+                        self.audio_change_finished.emit(change_id, False)
                     return
 
                 if action == "tune_scan_result":
                     if self.scan_tune_target == args and self.scan_tune_task is not None and not self.scan_tune_task.done():
+                        track_audio_change(self.scan_tune_task)
                         return
                     self._cancel_scan_tune()
                     self.scan_tune_target = args
-                    self.scan_tune_task = asyncio.create_task(self._guard(method(*args)))
+                    self.scan_tune_task = asyncio.create_task(self._run_action(method, args))
+                    track_audio_change(self.scan_tune_task)
                     return
 
-                if action in {"set_frequency", "set_ensemble", "set_service", "set_data_service", "close_service", "start_scan", "select_tuner"}:
+                if action in {"set_frequency", "set_ensemble", "set_service", "set_data_service", "close_service", "start_scan", "seek", "select_tuner"}:
                     self._cancel_scan_tune()
 
-                if action in {"load_spi", "load_journaline", "load_tpeg", "load_fic"}:
+                if action in {"load_spi", "load_spi_group", "load_journaline", "load_tpeg", "load_fic"}:
                     self._schedule_coalesced_action(action, method, args)
                     return
 
-                asyncio.create_task(self._guard(method(*args)))
+                task = asyncio.create_task(self._run_action(method, args))
+                track_audio_change(task)
 
             self.loop.call_soon_threadsafe(schedule)
+
+        async def _run_action(self, method, args):
+            await self._guard(method(*args))
+
+        async def _complete_audio_change(self, change_id):
+            refreshed = False
+            try:
+                properties = self.properties
+                if properties is None or change_id != self.audio_change_sequence:
+                    return
+
+                values = {}
+                for interface in (TUNER_INTERFACE, AUDIO_INTERFACE, SCAN_INTERFACE):
+                    if interface in self.available_interfaces:
+                        values.update(await properties.call_get_all(interface))
+
+                if properties is not self.properties or change_id != self.audio_change_sequence:
+                    return
+
+                self.cache.update({name: value.value for name, value in values.items()})
+                refreshed = self._emit_status(set(values))
+            except Exception as error:
+                self.message.emit(f"Could not refresh audio status: {error}")
+            finally:
+                self.audio_change_finished.emit(change_id, refreshed)
 
         def _cancel_scan_tune(self):
             if self.scan_tune_task is not None and not self.scan_tune_task.done():
@@ -1447,9 +1555,10 @@ if QT_AVAILABLE:
                 self.status_cache = update_status_from_properties(self.cache, self.status_cache, changed)
             except Exception as error:
                 self.message.emit(f"Could not decode D-Bus status: {error}")
-                return
+                return False
 
             self.status_changed.emit(self.status_cache, list(changed))
+            return True
 
         def _feature_interface(self, interface_name):
             return self.interfaces.get(interface_name)
@@ -1553,6 +1662,27 @@ if QT_AVAILABLE:
             success = await scan.call_start_scan(str(mode))
             self.message.emit(f"{mode.capitalize()} scan started." if success else f"Could not start {mode} scan.")
 
+        async def _action_seek(self, direction):
+            scan = self._feature_interface(SCAN_INTERFACE)
+            method = getattr(scan, "call_seek_up" if direction == "up" else "call_seek_down", None)
+
+            if method is None:
+                self.message.emit("Seek is not available in this daemon.")
+                return
+
+            success = await method()
+            self.message.emit(f"Seek {direction} started." if success else "Could not start seek.")
+
+        async def _action_stop_seek(self):
+            scan = self._feature_interface(SCAN_INTERFACE)
+            method = getattr(scan, "call_stop_seek", None)
+
+            if method is None:
+                return
+
+            success = await method()
+            self.message.emit("Seek stop requested." if success else "No active seek.")
+
         async def _action_stop_scan(self):
             scan = self._feature_interface(SCAN_INTERFACE)
 
@@ -1570,12 +1700,13 @@ if QT_AVAILABLE:
             success = await self.tuner.call_set_data_service(int(service_id), bool(data_service), int(component_id), int(application_type))
             self.message.emit("Data service opened." if success else "Could not open data service.")
 
-        async def _action_load_spi(self, detail_index=0, epg_service_id=-1, epg_date=""):
+        async def _action_load_spi(self, detail_index=0, epg_service_id=-1, epg_date="", view_epoch=0):
             spi = self._feature_interface(SPI_INTERFACE)
 
             if spi is None:
                 return
 
+            context = self.tuner_path, self.cache.get("Frequency", 0)
             detail_index = int(detail_index)
             service_components = list(self.cache.get("ServiceComponents", []))
             services = list(self.cache.get("Services", []))
@@ -1662,8 +1793,9 @@ if QT_AVAILABLE:
                     group = format_spi_programme_group(raw_item)
                     name = group["long_name"] or group["medium_name"] or group["short_name"] or "-"
                     description = group["long_description"] or group["short_description"] or "-"
-                    group_id = group["id"] or (str(group["short_id"]) if group["short_id"] else "-")
+                    group_id = group["id"] or str(group["short_id"])
                     rows.append([group_id, name, description])
+                    user_data.append(group)
             elif detail_index == 3:
                 objects_variant = await self.properties.call_get(SPI_INTERFACE, "SPIObjects")
                 objects = list(objects_variant.value)
@@ -1698,7 +1830,12 @@ if QT_AVAILABLE:
                     for item in assets
                 ]
 
+            if context != (self.tuner_path, self.cache.get("Frequency", 0)) or spi is not self._feature_interface(SPI_INTERFACE):
+                return
+
             self.spi_loaded.emit({
+                "context": context,
+                "view_epoch": view_epoch,
                 "revision": revision,
                 "transports": transports,
                 "transport_rows": transport_rows,
@@ -1707,6 +1844,42 @@ if QT_AVAILABLE:
                 "detail_user_data": user_data,
                 "epg_service_id": int(epg_service_id),
                 "epg_date": epg_date,
+            })
+
+        async def _action_load_spi_group(self, view_epoch, request_id, group_id, short_id):
+            spi = self._feature_interface(SPI_INTERFACE)
+
+            if spi is None:
+                return
+
+            context = self.tuner_path, self.cache.get("Frequency", 0)
+            supported = hasattr(spi, "call_get_group_programmes")
+            raw_programmes = await spi.call_get_group_programmes(group_id, short_id) if supported else []
+
+            if context != (self.tuner_path, self.cache.get("Frequency", 0)) or spi is not self._feature_interface(SPI_INTERFACE):
+                return
+
+            programmes = [format_spi_programme(item) for item in raw_programmes]
+            programmes.sort(key=epg_programme_sort_key)
+            service_names = {int(service[0]): service[1] or service[2] or display_sid(service[0]) for service in self.cache.get("Services", [])}
+            rows = []
+            now_timestamp = int(datetime.now().timestamp())
+
+            for programme in programmes:
+                service_name = service_names.get(programme["service_id"], display_sid(programme["service_id"], programme["data_service"]))
+                row = epg_programme_row(programme, service_name, now_timestamp)
+                start = parse_spi_datetime(programme_effective_start(programme))
+                row.insert(1, start.strftime("%Y-%m-%d") if start else "-")
+                rows.append(row)
+
+            self.spi_group_loaded.emit({
+                "context": context,
+                "view_epoch": view_epoch,
+                "request_id": request_id,
+                "group_key": (group_id, short_id),
+                "supported": supported,
+                "rows": rows,
+                "programmes": programmes,
             })
 
         def _journaline_context(self):
@@ -1811,10 +1984,17 @@ if QT_AVAILABLE:
             if tpeg is None:
                 return
 
+            context = self.tuner_path, self.cache.get("Frequency", 0)
             service_components = list(self.cache.get("ServiceComponents", []))
             revision = self.cache.get("TPEGRevision", 0)
             status = format_tpeg_status(self.cache.get("TPEGStatus", [0, 0, 0, 0, 0, 0, 0, 0, 0]))
-            raw_services, raw_frames = await asyncio.gather(tpeg.call_get_tpeg_services(), tpeg.call_get_tpeg_frames(0, 64))
+            raw_services, raw_frames = await asyncio.gather(tpeg.call_get_tpeg_services(), tpeg.call_get_tpeg_frames(0, 128))
+            information, messages, content_status = [], [], [0, 0, 0, 0]
+            if hasattr(tpeg, "call_get_tpeg_messages"):
+                information, messages, content_status = await asyncio.gather(
+                    tpeg.call_get_tpeg_service_information(), tpeg.call_get_tpeg_messages(), tpeg.call_get_tpeg_content_status())
+            if context != (self.tuner_path, self.cache.get("Frequency", 0)) or tpeg is not self._feature_interface(TPEG_INTERFACE):
+                return
             transports = []
 
             for raw_component in service_components:
@@ -1836,6 +2016,10 @@ if QT_AVAILABLE:
                 })
 
             self.tpeg_loaded.emit({
+                "context": context,
+                "information": information,
+                "messages": [format_tpeg_message(message) for message in messages],
+                "content_status": content_status,
                 "revision": revision,
                 "status": status,
                 "transports": transports,
@@ -1860,12 +2044,19 @@ if QT_AVAILABLE:
             self.logo_network = QNetworkAccessManager(self)
             self.audio_target = None
             self.audio_stopping = False
+            self.audio_pending_changes = set()
+            self.audio_latest_change = 0
+            self.audio_status_current = True
             self.closing = False
             self.spi_data = None
             self.spi_detail_rows = {}
             self.spi_detail_user_data = {}
             self.spi_detail_counts = {}
             self.epg_selected_key = None
+            self.spi_view_epoch = 0
+            self.spi_group_request_id = 0
+            self.spi_group_selected_key = None
+            self.spi_group_programme_key = None
             self.journaline_view_epoch = 0
             self.journaline_selected_object = None
             self.journaline_request_id = 0
@@ -1892,12 +2083,15 @@ if QT_AVAILABLE:
             self.audio_stop_timer.timeout.connect(self._kill_audio_process_if_needed)
             self.worker = DABWorker(self)
             self.worker.status_changed.connect(self.on_status_changed)
+            self.worker.audio_change_started.connect(self._begin_audio_change)
+            self.worker.audio_change_finished.connect(self._finish_audio_change)
             self.worker.tuner_list_changed.connect(self.on_tuner_list_changed)
             self.worker.tuner_changed.connect(self.on_tuner_changed)
             self.worker.interfaces_changed.connect(self.on_interfaces_changed)
             self.worker.message.connect(self.statusBar().showMessage)
             self.worker.connected_changed.connect(self.on_connected_changed)
             self.worker.spi_loaded.connect(self.on_spi_loaded)
+            self.worker.spi_group_loaded.connect(self.on_spi_group_loaded)
             self.worker.journaline_loaded.connect(self.on_journaline_loaded)
             self.worker.journaline_object_loaded.connect(self.on_journaline_object_loaded)
             self.worker.tpeg_loaded.connect(self.on_tpeg_loaded)
@@ -1915,6 +2109,10 @@ if QT_AVAILABLE:
             self.tpeg_refresh_timer.setSingleShot(True)
             self.tpeg_refresh_timer.setInterval(500)
             self.tpeg_refresh_timer.timeout.connect(lambda: self.worker.invoke("load_tpeg"))
+            self.tpeg_expiry_timer = QTimer(self)
+            self.tpeg_expiry_timer.setInterval(1000)
+            self.tpeg_expiry_timer.timeout.connect(self._refresh_tpeg_expiry)
+            self.tpeg_expiry_timer.start()
 
             self.setWindowTitle("DAB Daemon Control")
             self.resize(1380, 900)
@@ -1988,8 +2186,21 @@ if QT_AVAILABLE:
             tuning_layout.addWidget(QLabel("Frequency"))
             tuning_layout.addWidget(self.frequency_spin)
             tuning_layout.addWidget(self.tune_frequency_button)
+            tuning_layout.addSpacing(20)
+            self.seek_up_button = QPushButton("Seek Up")
+            self.seek_down_button = QPushButton("Seek Down")
+            self.seek_stop_button = QPushButton("Stop Seek")
+            self.seek_state = QLabel("Idle")
+            self.seek_up_button.clicked.connect(lambda: self.worker.invoke("seek", "up"))
+            self.seek_down_button.clicked.connect(lambda: self.worker.invoke("seek", "down"))
+            self.seek_stop_button.clicked.connect(lambda: self.worker.invoke("stop_seek"))
+            tuning_layout.addWidget(self.seek_up_button)
+            tuning_layout.addWidget(self.seek_down_button)
+            tuning_layout.addWidget(self.seek_stop_button)
+            tuning_layout.addWidget(self.seek_state)
             tuning_layout.addStretch(1)
             layout.addWidget(tuning)
+            self._update_tuning(None)
 
             splitter = QSplitter(Qt.Orientation.Horizontal)
             left = QWidget()
@@ -2245,11 +2456,26 @@ if QT_AVAILABLE:
             self.spi_programmes_table.selectionModel().currentRowChanged.connect(self.on_epg_selection_changed)
 
             self.spi_groups_table = self._table(["ID", "Group", "Description"])
+            self.spi_groups_page = QWidget()
+            groups_layout = QVBoxLayout(self.spi_groups_page)
+            groups_splitter = QSplitter(Qt.Orientation.Vertical)
+            self.spi_group_programmes = self._table(["Status", "Date", "Start", "End", "Service", "Programme", "Duration", "Genre", "Description"])
+            self.spi_group_detail = QTextBrowser()
+            self.spi_group_detail.setPlaceholderText("Select a programme to show details.")
+            groups_splitter.addWidget(self.spi_groups_table)
+            groups_splitter.addWidget(self.spi_group_programmes)
+            groups_splitter.addWidget(self.spi_group_detail)
+            groups_splitter.setStretchFactor(0, 1)
+            groups_splitter.setStretchFactor(1, 2)
+            groups_splitter.setStretchFactor(2, 1)
+            groups_layout.addWidget(groups_splitter)
+            self.spi_groups_table.selectionModel().currentRowChanged.connect(self.on_spi_group_selection_changed)
+            self.spi_group_programmes.selectionModel().currentRowChanged.connect(self.on_spi_group_programme_changed)
             self.spi_objects_table = self._table(["Transport ID", "Type/Subtype", "Bytes", "Content name", "MIME", "Compression", "Profile", "Decode"])
             self.spi_assets_table = self._table(["Transport ID", "Content name", "MIME", "Path"])
             self.spi_detail_tabs.addTab(self.spi_services_table, "Services")
             self.spi_detail_tabs.addTab(self.epg_page, "EPG")
-            self.spi_detail_tabs.addTab(self.spi_groups_table, "Groups")
+            self.spi_detail_tabs.addTab(self.spi_groups_page, "Groups")
             self.spi_detail_tabs.addTab(self.spi_objects_table, "Objects")
             self.spi_detail_tabs.addTab(self.spi_assets_table, "Assets")
             self.spi_detail_tabs.currentChanged.connect(self.on_spi_detail_tab_changed)
@@ -2304,7 +2530,7 @@ if QT_AVAILABLE:
             page = QWidget()
             layout = QVBoxLayout(page)
             header = QHBoxLayout()
-            self.tpeg_status = QLabel("No TPEG messages")
+            self.tpeg_status = QLabel("No TPEG frames")
             self.tpeg_services = QLabel("")
             self.tpeg_refresh_button = QPushButton("Refresh")
             self.tpeg_refresh_button.clicked.connect(lambda: self.worker.invoke("load_tpeg"))
@@ -2325,9 +2551,67 @@ if QT_AVAILABLE:
             layout.addLayout(header)
             self.tpeg_transport_table = self._table(["SID", "SCIdS", "SubCh", "Packet", "FEC"])
             self.tpeg_transport_table.selectionModel().currentRowChanged.connect(lambda: self._update_transport_button(self.tpeg_transport_table, self.tpeg_open_button))
+            self.tpeg_transport_table.setMaximumHeight(100)
+            self.tpeg_transport_table.hide()
             layout.addWidget(self.tpeg_transport_table)
+            self.tpeg_content_tabs = QTabWidget()
+            messages_page = QWidget()
+            messages_layout = QVBoxLayout(messages_page)
+            messages_layout.setContentsMargins(0, 0, 0, 0)
+            filters = QHBoxLayout()
+            self.tpeg_application_filter = QComboBox()
+            for label, value in (("All applications", 0), ("TEC", 5), ("TFP", 7)):
+                self.tpeg_application_filter.addItem(label, value)
+            self.tpeg_search = QLineEdit()
+            self.tpeg_search.setPlaceholderText("Search messages and fields")
+            self.tpeg_application_filter.currentIndexChanged.connect(self._render_tpeg_messages)
+            self.tpeg_search.textChanged.connect(self._render_tpeg_messages)
+            filters.addWidget(self.tpeg_application_filter)
+            filters.addWidget(self.tpeg_search, 1)
+            messages_layout.addLayout(filters)
+            self.tpeg_messages = []
+            self.tpeg_expiry_states = []
+            self.tpeg_rendering = False
+            self.tpeg_displayed_message = None
+            self.tpeg_messages_table = self._table(["Application", "Service", "SCID", "Message", "Version", "State", "Summary", "Expires"])
+            message_header = self.tpeg_messages_table.horizontalHeader()
+            message_header.setStretchLastSection(False)
+            for column in (0, 1, 2, 3, 4, 5, 7):
+                message_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+            message_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+            self.tpeg_messages_table.selectionModel().currentRowChanged.connect(self._show_tpeg_message)
+            details = QTabWidget()
+            self.tpeg_fields_table = self._table(["Component", "Field", "Value"])
+            for column in (0, 1):
+                self.tpeg_fields_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+            self.tpeg_message_raw = QPlainTextEdit()
+            self.tpeg_message_raw.setReadOnly(True)
+            self.tpeg_message_raw.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+            details.addTab(self.tpeg_fields_table, "Fields")
+            details.addTab(self.tpeg_message_raw, "Raw message")
+            splitter = QSplitter(Qt.Orientation.Vertical)
+            splitter.addWidget(self.tpeg_messages_table)
+            splitter.addWidget(details)
+            splitter.setSizes([400, 250])
+            messages_layout.addWidget(splitter, 1)
+            self.tpeg_content_tabs.addTab(messages_page, "Messages")
+            self.tpeg_information_table = self._table(["Service", "Name", "SCID", "COID", "Application", "Version", "Messages", "Encryption", "Description"])
+            for column in range(8):
+                self.tpeg_information_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+            self.tpeg_content_tabs.addTab(self.tpeg_information_table, "Services")
             self.tpeg_frames_table = self._table(["Seq", "Type", "Service", "Enc", "Components", "Bytes"])
-            layout.addWidget(self.tpeg_frames_table, 1)
+            self.tpeg_frames_table.selectionModel().currentRowChanged.connect(self._show_tpeg_frame)
+            for column in range(5):
+                self.tpeg_frames_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+            self.tpeg_frame_raw = QPlainTextEdit()
+            self.tpeg_frame_raw.setReadOnly(True)
+            self.tpeg_frame_raw.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+            frames = QSplitter(Qt.Orientation.Vertical)
+            frames.addWidget(self.tpeg_frames_table)
+            frames.addWidget(self.tpeg_frame_raw)
+            frames.setSizes([400, 250])
+            self.tpeg_content_tabs.addTab(frames, "Frames")
+            layout.addWidget(self.tpeg_content_tabs, 1)
             return page
 
         def _build_scan_tab(self):
@@ -2551,7 +2835,13 @@ if QT_AVAILABLE:
                 tab_widget.setTabVisible(index, bool(visible))
 
         def on_interfaces_changed(self, interfaces):
+            previous = self.available_interfaces
             self.available_interfaces = set(interfaces)
+            self._update_tuning(self.status)
+
+            if SPI_INTERFACE in previous and SPI_INTERFACE not in self.available_interfaces:
+                self._reset_spi_view()
+
             self._set_tab_visible(self.tabs, self.fic_tab, DIAGNOSTICS_INTERFACE in self.available_interfaces and self.status is not None and self.status.get("fic_revision") is not None)
             self.audio_playback_group.setVisible(AUDIO_INTERFACE in self.available_interfaces)
             self.signal_group.setVisible(SIGNAL_INTERFACE in self.available_interfaces)
@@ -2567,7 +2857,7 @@ if QT_AVAILABLE:
             self._set_tab_visible(self.data_tabs, self.journaline_tab, JOURNALINE_INTERFACE in self.available_interfaces)
             self._set_tab_visible(self.data_tabs, self.tpeg_tab, TPEG_INTERFACE in self.available_interfaces)
             self._set_tab_visible(self.tabs, self.data_tab, bool(self.available_interfaces.intersection({SPI_INTERFACE, JOURNALINE_INTERFACE, TPEG_INTERFACE})))
-            self._set_tab_visible(self.tabs, self.scan_tab, SCAN_INTERFACE in self.available_interfaces)
+            self._set_tab_visible(self.tabs, self.scan_tab, SCAN_INTERFACE in self.available_interfaces and (self.status is None or bool(set(self.status["scan_modes"]).intersection({"fast", "full"}))))
 
             diagnostic_interfaces = {
                 DIAGNOSTICS_INTERFACE,
@@ -2604,6 +2894,8 @@ if QT_AVAILABLE:
             if path != self.tuner_path:
                 self._reset_fic_view()
                 self._reset_journaline_view()
+                self._reset_spi_view()
+                self._reset_tpeg_view()
                 self.status = None
                 self._update_service_details()
                 self._stop_audio_process()
@@ -2625,14 +2917,41 @@ if QT_AVAILABLE:
             if ensemble:
                 self.worker.invoke("set_ensemble", ensemble[0])
 
+        def _update_tuning(self, status):
+            modes = set(status["scan_modes"]) if status is not None else set()
+            available = status is not None and SCAN_INTERFACE in self.available_interfaces
+            active = status is not None and status["scan_state"] in {"Scanning", "Stopping"}
+            seeking = status is not None and status["scan_mode"] in {"seek_up", "seek_down"}
+            self.seek_up_button.setEnabled(available and "seek_up" in modes and not active)
+            self.seek_down_button.setEnabled(available and "seek_down" in modes and not active)
+            self.seek_stop_button.setEnabled(available and seeking and status["scan_state"] == "Scanning")
+            self.tune_channel_button.setEnabled(status is not None and not active)
+            self.tune_frequency_button.setEnabled(status is not None and not active)
+            label = status["scan_state"] if seeking else "Scanning" if active else "Idle"
+
+            if seeking and active and status["scan_progress"]["channel"]:
+                label += " · " + status["scan_progress"]["channel"]
+
+            self.seek_state.setText(label if status is not None else "No tuner")
+
+            if hasattr(self, "scan_tab"):
+                self._set_tab_visible(self.tabs, self.scan_tab, available and bool(modes.intersection({"fast", "full"})))
+                self.scan_fast_button.setEnabled(available and "fast" in modes and not active)
+                self.scan_full_button.setEnabled(available and "full" in modes and not active)
+
         def on_status_changed(self, status, changed_properties):
             previous = self.status
             self.status = status
             changed = set(changed_properties)
+            self._update_tuning(status)
             self._set_tab_visible(self.tabs, self.fic_tab, DIAGNOSTICS_INTERFACE in self.available_interfaces and status is not None and status.get("fic_revision") is not None)
 
             if status is None or "Frequency" in changed:
                 self._reset_fic_view()
+
+            if status is None or previous is None or status["frequency"] != previous["frequency"]:
+                self._reset_spi_view()
+                self._reset_tpeg_view()
 
             journaline_changed = status is None or previous is None or (
                 status["frequency"], status["service"][0] if status["service"] else 0
@@ -2657,7 +2976,8 @@ if QT_AVAILABLE:
                 self._stop_audio_process()
                 return
 
-            if not changed or changed.intersection({"AudioPipe", "AudioCodec", "Service"}):
+            if not changed or changed.intersection({"AudioPipe", "AudioCodec", "Service", "Frequency", "ScanState"}):
+                self.audio_status_current = True
                 self._sync_audio_player()
 
             if not changed or "Services" in changed:
@@ -2704,13 +3024,16 @@ if QT_AVAILABLE:
                 self.spi_refresh_timer.start()
             if (journaline_changed or "JournalineRevision" in changed) and self._data_tab_active(1):
                 self.journaline_refresh_timer.start()
-            if "TPEGRevision" in changed and self._data_tab_active(2):
+            if changed.intersection({"TPEGRevision", "TPEGStatus"}) and self._data_tab_active(2):
                 self.tpeg_refresh_timer.start()
             self.tpeg_stop_button.setVisible(status["tpeg_receiving"] is not None)
             self.tpeg_stop_button.setEnabled(bool(status["tpeg_receiving"]) and status["scan_state"] not in {"Scanning", "Stopping"})
 
         def _audio_target_from_status(self):
-            if not self.status:
+            if not self.status or self.audio_pending_changes or not self.audio_status_current:
+                return None
+
+            if self.status.get("scan_state") in {"Scanning", "Stopping"}:
                 return None
 
             audio_pipe = self.status.get("audio_pipe", "")
@@ -2719,7 +3042,20 @@ if QT_AVAILABLE:
             if not mpv_arguments(audio_pipe, audio_codec):
                 return None
 
-            return audio_pipe, audio_codec
+            service = self.status.get("service")
+            return audio_pipe, audio_codec, self.status.get("frequency", 0), service[0] if service else 0
+
+        def _begin_audio_change(self, change_id):
+            self.audio_pending_changes.add(change_id)
+            self.audio_latest_change = change_id
+            self.audio_status_current = False
+            self._stop_audio_process(immediate=True)
+
+        def _finish_audio_change(self, change_id, refreshed):
+            self.audio_pending_changes.discard(change_id)
+            if change_id == self.audio_latest_change:
+                self.audio_status_current = refreshed
+            self._sync_audio_player()
 
         def _audio_auto_play_changed(self, enabled):
             if enabled:
@@ -2738,7 +3074,7 @@ if QT_AVAILABLE:
                 if self.audio_target == target:
                     return
 
-                self._stop_audio_process()
+                self._stop_audio_process(immediate=True)
                 return
 
             self._start_audio_process(target)
@@ -2765,7 +3101,7 @@ if QT_AVAILABLE:
                 self.statusBar().showMessage("mpv was not found in PATH.")
                 return
 
-            audio_pipe, audio_codec = target
+            audio_pipe, audio_codec = target[:2]
             arguments = mpv_arguments(audio_pipe, audio_codec)
             if not arguments:
                 return
@@ -2778,7 +3114,7 @@ if QT_AVAILABLE:
             self.audio_process.setArguments(arguments)
             self.audio_process.start()
 
-        def _stop_audio_process(self):
+        def _stop_audio_process(self, immediate=False):
             self.audio_target = None
 
             if self.audio_process.state() == QProcess.ProcessState.NotRunning:
@@ -2788,12 +3124,17 @@ if QT_AVAILABLE:
                 return
 
             if self.audio_stopping:
+                if immediate:
+                    self.audio_process.kill()
                 return
 
             self.audio_stopping = True
             self.audio_player_state.setText("Stopping…")
             self.audio_stop_timer.start()
-            self.audio_process.terminate()
+            if immediate:
+                self.audio_process.kill()
+            else:
+                self.audio_process.terminate()
 
         def _kill_audio_process_if_needed(self):
             if self.audio_stopping and self.audio_process.state() != QProcess.ProcessState.NotRunning:
@@ -3336,8 +3677,8 @@ if QT_AVAILABLE:
             mode = status["scan_mode"]
             progress = status["scan_progress"]
             active = state in {"Scanning", "Stopping"}
-            self.scan_fast_button.setEnabled(not active)
-            self.scan_full_button.setEnabled(not active)
+            self.scan_fast_button.setEnabled(not active and "fast" in status["scan_modes"])
+            self.scan_full_button.setEnabled(not active and "full" in status["scan_modes"])
             self.scan_stop_button.setEnabled(state == "Scanning")
             if state in {"Idle", "Cancelled"}:
                 state = "Idle"
@@ -3633,6 +3974,25 @@ if QT_AVAILABLE:
             elif index == 2:
                 self.worker.invoke("load_tpeg")
 
+        def _reset_spi_view(self):
+            self.spi_refresh_timer.stop()
+            self.spi_view_epoch += 1
+            self.spi_group_request_id += 1
+            self.spi_data = None
+            self.spi_detail_rows.clear()
+            self.spi_detail_user_data.clear()
+            self.spi_detail_counts.clear()
+            self.epg_selected_key = None
+            self.spi_group_selected_key = None
+            self.spi_group_programme_key = None
+            self.spi_status.setText("No programme information")
+            self.epg_count_label.setText("No EPG loaded")
+            self.epg_detail.clear()
+            self.spi_group_detail.clear()
+
+            for table in (self.spi_transport_table, self.spi_services_table, self.spi_programmes_table, self.spi_groups_table, self.spi_group_programmes, self.spi_objects_table, self.spi_assets_table):
+                self._set_table_rows(table, [])
+
         def _request_spi_load(self):
             if not hasattr(self, "spi_detail_tabs"):
                 return
@@ -3643,10 +4003,10 @@ if QT_AVAILABLE:
                 service_id = self.epg_service_combo.currentData()
                 service_id = -1 if service_id is None else int(service_id)
                 epg_date = self.epg_date_edit.date().toString("yyyy-MM-dd")
-                self.worker.invoke("load_spi", detail_index, service_id, epg_date)
+                self.worker.invoke("load_spi", detail_index, service_id, epg_date, self.spi_view_epoch)
                 return
 
-            self.worker.invoke("load_spi", detail_index)
+            self.worker.invoke("load_spi", detail_index, -1, "", self.spi_view_epoch)
 
         def _data_tab_active(self, index):
             return self.tabs.currentWidget() is self.data_tab and self.data_tabs.currentIndex() == index
@@ -3662,6 +4022,9 @@ if QT_AVAILABLE:
             )
 
         def on_spi_loaded(self, data):
+            if self.status is None or data.get("context") != (self.tuner_path, self.status["frequency"]) or data.get("view_epoch") != self.spi_view_epoch:
+                return
+
             self.spi_data = data
             detail_index = data["detail_index"]
             self._set_table_rows(self.spi_transport_table, data["transport_rows"], data["transports"])
@@ -3699,6 +4062,64 @@ if QT_AVAILABLE:
 
             if self._data_tab_active(0):
                 self._request_spi_load()
+
+        def on_spi_group_selection_changed(self, current, _previous):
+            self.spi_group_request_id += 1
+            self._set_table_rows(self.spi_group_programmes, [])
+            self.spi_group_detail.clear()
+
+            if not current.isValid() or self.status is None:
+                return
+
+            group = self.spi_groups_table.model().row_user_data(current.row())
+
+            if not isinstance(group, dict):
+                return
+
+            key = group["id"], group["short_id"]
+
+            if key != self.spi_group_selected_key:
+                self.spi_group_programme_key = None
+
+            self.spi_group_selected_key = key
+            self.worker.invoke("load_spi_group", self.spi_view_epoch, self.spi_group_request_id, *key)
+
+        def on_spi_group_loaded(self, data):
+            if self.status is None or data["context"] != (self.tuner_path, self.status["frequency"]):
+                return
+
+            if data["view_epoch"] != self.spi_view_epoch or data["request_id"] != self.spi_group_request_id or data["group_key"] != self.spi_group_selected_key:
+                return
+
+            self.spi_group_programmes.setVisible(data["supported"])
+            self.spi_group_detail.setVisible(data["supported"])
+            self.spi_group_detail.clear()
+            self._set_table_rows(self.spi_group_programmes, data["rows"], data["programmes"])
+            target_row = 0
+
+            for row, programme in enumerate(data["programmes"]):
+                if epg_programme_key(programme) == self.spi_group_programme_key:
+                    target_row = row
+                    break
+
+            if data["programmes"]:
+                self.spi_group_programmes.selectRow(target_row)
+            else:
+                self.spi_group_programme_key = None
+
+        def on_spi_group_programme_changed(self, current, _previous):
+            if not current.isValid():
+                self.spi_group_detail.clear()
+                return
+
+            model = self.spi_group_programmes.model()
+            programme = model.row_user_data(current.row())
+
+            if not isinstance(programme, dict):
+                return
+
+            self.spi_group_programme_key = epg_programme_key(programme)
+            self.spi_group_detail.setPlainText(programme_detail_text(programme, model.rows[current.row()][4]))
 
         def on_epg_filter_changed(self, *_):
             self.epg_selected_key = None
@@ -3743,32 +4164,7 @@ if QT_AVAILABLE:
             self.epg_selected_key = epg_programme_key(programme)
             row = model.rows[current.row()] if current.row() < len(model.rows) else []
             service_name = row[3] if len(row) > 3 else display_sid(programme["service_id"], programme["data_service"])
-            start = programme_effective_start(programme) or "-"
-            duration = programme_effective_duration(programme)
-            lines = [
-                programme_title(programme),
-                f"Service: {service_name}",
-                f"Time: {start} · {format_duration(duration)}",
-            ]
-
-            if programme.get("actual_time") and programme.get("start_time") and programme["actual_time"] != programme["start_time"]:
-                lines.append(f'Scheduled: {programme["start_time"]} · {format_duration(programme.get("duration", 0))}')
-
-            if programme.get("language"):
-                lines.append(f'Language: {programme["language"]}')
-            if programme.get("genres"):
-                lines.append(f'Genre: {", ".join(programme["genres"])}')
-
-            lines.append(f'Programme ID: {programme.get("id") or programme.get("short_id") or "-"}')
-            description = programme_description(programme)
-            if description != "-":
-                lines.extend(["", description])
-
-            media = [item.get("path") or item.get("url") for item in programme.get("multimedia", []) if item.get("path") or item.get("url")]
-            if media:
-                lines.extend(["", "Media:", *media])
-
-            self.epg_detail.setPlainText("\n".join(lines))
+            self.epg_detail.setPlainText(programme_detail_text(programme, service_name))
 
         def _render_spi_detail(self, index):
             rows = self.spi_detail_rows.get(index)
@@ -3784,8 +4180,30 @@ if QT_AVAILABLE:
                 self.spi_assets_table,
             ]
 
+            if index == 2:
+                self.spi_group_request_id += 1
+                self._set_table_rows(self.spi_group_programmes, [])
+                self.spi_group_detail.clear()
+
             if 0 <= index < len(tables):
                 self._set_table_rows(tables[index], rows, self.spi_detail_user_data.get(index))
+
+            if index == 2:
+                target_row = 0
+
+                for row, group in enumerate(self.spi_detail_user_data.get(index, [])):
+                    key = self.spi_group_selected_key
+                    matches = key is not None and (group["id"] == key[0] if group["id"] and key[0] else group["short_id"] == key[1])
+
+                    if matches:
+                        target_row = row
+                        break
+
+                if rows:
+                    self.spi_groups_table.selectRow(target_row)
+                else:
+                    self.spi_group_selected_key = None
+                    self.spi_group_programme_key = None
 
             if index == 1:
                 programmes = self.spi_detail_user_data.get(index, [])
@@ -3948,27 +4366,135 @@ if QT_AVAILABLE:
                 if not codec:
                     value.setText("-")
 
+        def _reset_tpeg_view(self):
+            self.tpeg_refresh_timer.stop()
+            self.tpeg_displayed_message = None
+            self.tpeg_messages = []
+            self.tpeg_status.setText("No TPEG frames")
+            self.tpeg_services.clear()
+            for table in (self.tpeg_transport_table, self.tpeg_messages_table, self.tpeg_information_table, self.tpeg_fields_table, self.tpeg_frames_table):
+                self._set_table_rows(table, [])
+            self.tpeg_message_raw.clear()
+            self.tpeg_frame_raw.clear()
+            self.tpeg_open_button.hide()
+            self.tpeg_transport_table.hide()
+
         def on_tpeg_loaded(self, data):
+            if "context" in data and (self.status is None or data["context"] != (self.tuner_path, self.status["frequency"])):
+                return
             status = data["status"]
             count = status["frames_received"]
-            summary = f'{count} message{"s" if count != 1 else ""}' if count else "No TPEG messages"
-            errors = summarize_tpeg_errors(status)
+            summary = f'{count} frame{"s" if count != 1 else ""}' if count else "No TPEG frames"
+            crc_errors = sum(status[name] for name in ("group_crc_errors", "transport_crc_errors", "directory_crc_errors", "component_crc_errors"))
+            if crc_errors:
+                summary += f' · CRC {crc_errors:,}'
+            if status["continuity_errors"]:
+                summary += f' · continuity {status["continuity_errors"]:,}'
+            if status["malformed_frames"]:
+                summary += f' · malformed frames {status["malformed_frames"]:,}'
 
-            if errors:
-                summary += f' · {errors} error{"s" if errors != 1 else ""}'
-
+            content_status = data.get("content_status", [0, 0, 0, 0])
+            messages = data.get("messages", [])
+            summary += f' · {len(messages):,} messages'
+            if content_status[1] or content_status[2]:
+                summary += f' · data CRC {content_status[1]:,} · malformed {content_status[2]:,}'
+            if content_status[3]:
+                summary += f' · unsupported {content_status[3]:,}'
             self.tpeg_status.setText(summary)
             self.tpeg_services.setText("Services: " + (", ".join(data["services"]) or "-"))
             transport_rows = []
             for item in data["transports"]:
                 transport_rows.append([display_sid(item["service_id"], item["data_service"]), item["component_id"], item["subchannel"], item["packet_address"], item["fec_scheme"]])
             self._set_transport_rows(self.tpeg_transport_table, transport_rows, data["transports"], self.tpeg_open_button)
+            self.tpeg_transport_table.setVisible(bool(transport_rows))
 
             frame_rows = []
             for frame in data["frames"]:
                 components = ", ".join(f'{component["id"]:02X}:{len(component["data"])}' for component in frame["components"]) or "-"
                 frame_rows.append([frame["sequence"], frame["type"], frame["service"], frame["encryption"], components, len(frame["data"])])
-            self._set_table_rows(self.tpeg_frames_table, frame_rows)
+            selected_frame = self._selected_table_data(self.tpeg_frames_table)
+            selection = self.tpeg_frames_table.selectionModel()
+            selection.blockSignals(True)
+            try:
+                self._set_table_rows(self.tpeg_frames_table, frame_rows, data["frames"])
+                if selected_frame:
+                    row = next((index for index, frame in enumerate(data["frames"]) if frame["sequence"] == selected_frame["sequence"]), -1)
+                    if row >= 0:
+                        self.tpeg_frames_table.selectRow(row)
+            finally:
+                selection.blockSignals(False)
+            self._show_tpeg_frame()
+            information_rows = []
+            for service, name, description, version, encoding, applications in data.get("information", []):
+                for component, content, application, major, minor, count, encryption, component_description in applications:
+                    information_rows.append([format_tpeg_service(service), name, component, content, tpeg_application_name(application), f"{major}.{minor}", count, encryption, component_description or description])
+                if not applications:
+                    information_rows.append([format_tpeg_service(service), name, "-", "-", "-", "-", "-", "-", description])
+            self._set_table_rows(self.tpeg_information_table, information_rows)
+            self.tpeg_messages = messages
+            self._render_tpeg_messages()
+
+        def _refresh_tpeg_expiry(self):
+            if self._data_tab_active(2) and [tpeg_message_state(message) for message in self.tpeg_messages] != self.tpeg_expiry_states:
+                self._render_tpeg_messages()
+
+        def _render_tpeg_messages(self, *args):
+            self.tpeg_expiry_states = [tpeg_message_state(message) for message in self.tpeg_messages]
+            scroll = self.tpeg_messages_table.verticalScrollBar().value()
+            selected = self._selected_table_data(self.tpeg_messages_table)
+            selected_key = tpeg_message_key(selected) if selected else None
+            application = self.tpeg_application_filter.currentData()
+            search = self.tpeg_search.text().strip().casefold()
+            messages = []
+            for message in self.tpeg_messages:
+                if application and message["application"] != application:
+                    continue
+                if search:
+                    text = " ".join([message["service"], str(message["id"]), message["summary"]] + [" ".join(field) for field in message["fields"]])
+                    if search not in text.casefold():
+                        continue
+                messages.append(message)
+            messages.sort(key=lambda message: (-message["sequence"], message["id"]))
+            rows = [[tpeg_application_name(message["application"]), message["service"], message["component"], message["id"], message["version"], tpeg_message_state(message), message["summary"], datetime.fromtimestamp(message["expiry"], timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")] for message in messages]
+            self.tpeg_rendering = True
+            self._set_table_rows(self.tpeg_messages_table, rows, messages)
+            if messages:
+                row = next((index for index, message in enumerate(messages) if tpeg_message_key(message) == selected_key), 0)
+                self.tpeg_messages_table.selectRow(row)
+            self.tpeg_rendering = False
+            self.tpeg_messages_table.verticalScrollBar().setValue(scroll)
+            self._show_tpeg_message()
+
+        def _show_tpeg_message(self, *args):
+            if self.tpeg_rendering:
+                return
+            message = self._selected_table_data(self.tpeg_messages_table)
+            signature = (tpeg_message_key(message), message["data"], message["fields"], message["priority"], message["generation"], tpeg_message_state(message)) if message else None
+            if signature == self.tpeg_displayed_message:
+                return
+            self.tpeg_displayed_message = signature
+            fields = []
+            if message:
+                fields = [["Message", "Priority", message["priority"]], ["Message", "State", tpeg_message_state(message)]]
+                for component, name, value in message["fields"]:
+                    if name.endswith(" (UTC seconds)"):
+                        name = name.removesuffix(" (UTC seconds)")
+                        value = datetime.fromtimestamp(int(value), timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    fields.append([component, name, value])
+                if message["generation"]:
+                    fields.insert(0, ["Message", "Generated", datetime.fromtimestamp(message["generation"], timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")])
+            self._set_table_rows(self.tpeg_fields_table, fields)
+            self.tpeg_message_raw.setPlainText(fic_hex_dump(message["data"]) if message else "")
+
+        def _show_tpeg_frame(self, *args):
+            frame = self._selected_table_data(self.tpeg_frames_table)
+            text = ""
+            if frame:
+                text = fic_hex_dump(bytes(frame["data"]))
+                for component in frame["components"]:
+                    text += f'\n\nSCID {component["id"]}:\n' + fic_hex_dump(bytes(component["data"]))
+            if self.tpeg_frame_raw.toPlainText() != text:
+                self.tpeg_frame_raw.setPlainText(text)
 
         def _update_transport_button(self, table, button):
             transport = self._selected_table_data(table)

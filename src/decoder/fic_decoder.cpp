@@ -185,6 +185,60 @@ FICDecoder::Statistics FICDecoder::get_statistics() const {
     return statistics;
 }
 
+#if DAB_ENABLE_FULL_SCAN
+bool FICDecoder::is_service_information_complete() const {
+    if (!ensemble_valid || ensemble.id != ensemble_status.ensemble_id || ensemble.label.empty() || configuration_cleanup_pending || service_ids.empty() || service_ids.size() < ensemble_status.service_count) {
+        return false;
+    }
+
+    if (ensemble_status.service_count == 0) {
+        if (subchannels.empty()) {
+            return false;
+        }
+
+        for (const auto &[subchannel_id, subchannel]: subchannels) {
+            const auto component = subchannel_components.find(subchannel_id);
+
+            if (component != subchannel_components.end() && component->second.defined) {
+                continue;
+            }
+
+            const bool packet_service_found = std::ranges::any_of(packet_components | std::views::values, [subchannel_id](const TransportComponent &packet_component) {
+                return packet_component.defined && packet_component.subchannel == subchannel_id;
+            });
+
+            if (!packet_service_found) {
+                return false;
+            }
+        }
+    }
+
+    for (const auto &[service_id, service]: services) {
+        // Only supported, unencrypted primary audio components enter the station list.
+        if (service.primary_subchannel == 0xFF) {
+            continue;
+        }
+
+        if (service.label.empty() || !subchannels.contains(service.primary_subchannel) || !emitted_services.contains(service_id)) {
+            return false;
+        }
+    }
+
+    for (const auto &[label_key, label]: extended_labels) {
+        const uint8_t extension = label_key >> 60;
+        const uint16_t id = static_cast<uint16_t>(label_key);
+
+        if ((extension == 0 && id == ensemble.id) || (extension == 1 && services.contains(id) && services.at(id).primary_subchannel != 0xFF)) {
+            if (!label.initialized || !label.received[0] || (label.segment_count != 0 && !label.received[1])) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+#endif
+
 #if DAB_ENABLE_SERVICE_LINKING
 std::vector<FICDecoder::ServiceLink> FICDecoder::get_service_links() const {
     std::vector<ServiceLink> result;

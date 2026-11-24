@@ -329,6 +329,10 @@ public:
 
     Statistics get_statistics() const;
 
+#if DAB_ENABLE_FULL_SCAN
+    bool is_service_information_complete() const;
+#endif
+
 #if DAB_ENABLE_SERVICE_LINKING
     std::vector<ServiceLink> get_service_links() const;
 #endif

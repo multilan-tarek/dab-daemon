@@ -16,6 +16,8 @@ public:
 
     void write(const std::vector<uint8_t> &data);
 
+    void discard_buffered();
+
     void close();
 
 private:

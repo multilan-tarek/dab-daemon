@@ -38,6 +38,14 @@ public:
         bool operator==(const ServiceInformation &other) const = default;
     };
 
+    struct GroupMembership {
+        std::string id;
+        uint32_t short_id = 0xFFFFFFFF;
+        uint16_t index = 0;
+
+        bool operator==(const GroupMembership &) const = default;
+    };
+
     struct Programme {
         uint32_t service_id = 0;
         bool data_service = false;
@@ -56,13 +64,14 @@ public:
         uint32_t actual_duration = 0;
         std::vector<std::string> genres;
         std::vector<Multimedia> multimedia;
+        std::vector<GroupMembership> memberships;
 
         bool operator==(const Programme &other) const = default;
     };
 
     struct ProgrammeGroup {
         std::string id;
-        uint32_t short_id = 0;
+        uint32_t short_id = 0xFFFFFFFF;
         std::string short_name;
         std::string medium_name;
         std::string long_name;
@@ -70,6 +79,7 @@ public:
         std::string long_description;
         std::vector<std::string> genres;
         std::vector<Multimedia> multimedia;
+        std::vector<GroupMembership> memberships;
 
         bool operator==(const ProgrammeGroup &other) const = default;
     };
@@ -152,6 +162,8 @@ private:
     static void collect_names(const Node &node, const std::map<uint8_t, std::string> &tokens, std::string &short_name, std::string &medium_name, std::string &long_name);
 
     static void collect_media(const Node &node, const std::map<uint8_t, std::string> &tokens, std::string &short_description, std::string &long_description, std::vector<std::string> &genres, std::vector<Multimedia> &multimedia);
+
+    static std::vector<GroupMembership> collect_memberships(const Node &node, const std::map<uint8_t, std::string> &tokens);
 
     static Bearer decode_bearer(const std::vector<uint8_t> &data);
 

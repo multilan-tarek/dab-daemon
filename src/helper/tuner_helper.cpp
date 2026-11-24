@@ -827,7 +827,7 @@ bool TunerHelper::set_frequency(const uint32_t frequency) {
 
     set_register(0x23, static_cast<uint8_t>(pll_nf >> 22 & 0xFF));
     set_register(0x24, static_cast<uint8_t>(pll_nf >> 14 & 0xFF));
-    set_register(0x25, static_cast<uint8_t>(pll_nf >> 5 & 0xFF));
+    set_register(0x25, static_cast<uint8_t>(pll_nf >> 6 & 0xFF));
     set_register(0x26, static_cast<uint8_t>((pll_nf & 0x3F) << 2 | 0x01));
 
     const auto pll_start = std::chrono::steady_clock::now();

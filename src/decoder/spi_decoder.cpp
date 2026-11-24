@@ -1,4 +1,5 @@
 #include "spi_decoder.h"
+#include "../helper/spi_group_helper.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -92,12 +93,13 @@ void merge_programme(SPIDecoder::Programme &target, const SPIDecoder::Programme 
 
     merge_vector(target.genres, source.genres);
     merge_vector(target.multimedia, source.multimedia);
+    merge_vector(target.memberships, source.memberships);
 }
 
 void merge_programme_group(SPIDecoder::ProgrammeGroup &target, const SPIDecoder::ProgrammeGroup &source) {
     merge_string(target.id, source.id);
 
-    if (source.short_id != 0) {
+    if (source.short_id <= 0xFFFFFF) {
         target.short_id = source.short_id;
     }
 
@@ -108,6 +110,7 @@ void merge_programme_group(SPIDecoder::ProgrammeGroup &target, const SPIDecoder:
     merge_string(target.long_description, source.long_description);
     merge_vector(target.genres, source.genres);
     merge_vector(target.multimedia, source.multimedia);
+    merge_vector(target.memberships, source.memberships);
 }
 
 }
@@ -485,6 +488,31 @@ void SPIDecoder::collect_media(const Node &node, const std::map<uint8_t, std::st
     }
 }
 
+std::vector<SPIDecoder::GroupMembership> SPIDecoder::collect_memberships(const Node &node, const std::map<uint8_t, std::string> &tokens) {
+    std::vector<GroupMembership> result;
+
+    for (const auto &member: find_children(node, 0x17)) {
+        GroupMembership membership;
+        membership.id = get_string_attribute(*member, 0x80, tokens);
+        const auto short_id = member->attributes.find(0x81);
+        const auto index = member->attributes.find(0x82);
+
+        if (short_id != member->attributes.end() && short_id->second.size() == 3) {
+            membership.short_id = decode_integer(short_id->second);
+        }
+
+        if (index != member->attributes.end() && index->second.size() == 2) {
+            membership.index = static_cast<uint16_t>(decode_integer(index->second));
+        }
+
+        if (!membership.id.empty() || membership.short_id <= 0xFFFFFF) {
+            merge_vector(result, std::vector<GroupMembership>{membership});
+        }
+    }
+
+    return result;
+}
+
 SPIDecoder::Bearer SPIDecoder::decode_bearer(const std::vector<uint8_t> &data) {
     Bearer result;
     BitReader reader(data);
@@ -782,6 +810,7 @@ void SPIDecoder::process_programme_information(const Node &root, const std::map<
 
             collect_names(*programme_node, tokens, programme.short_name, programme.medium_name, programme.long_name);
             collect_media(*programme_node, tokens, programme.short_description, programme.long_description, programme.genres, programme.multimedia);
+            programme.memberships = collect_memberships(*programme_node, tokens);
             Bearer programme_bearer = schedule_bearer;
 
             for (const auto &location: find_children(*programme_node, 0x19)) {
@@ -852,15 +881,16 @@ void SPIDecoder::process_group_information(const Node &root, const std::map<uint
             incoming.id = get_string_attribute(*group_node, 0x80, tokens);
             const auto short_id = group_node->attributes.find(0x81);
 
-            if (short_id != group_node->attributes.end()) {
+            if (short_id != group_node->attributes.end() && short_id->second.size() == 3) {
                 incoming.short_id = decode_integer(short_id->second);
             }
 
             collect_names(*group_node, tokens, incoming.short_name, incoming.medium_name, incoming.long_name);
             collect_media(*group_node, tokens, incoming.short_description, incoming.long_description, incoming.genres, incoming.multimedia);
+            incoming.memberships = collect_memberships(*group_node, tokens);
             const std::string key = !incoming.id.empty() ? incoming.id : std::to_string(incoming.short_id);
 
-            if (key.empty() || key == "0") {
+            if (incoming.id.empty() && incoming.short_id > 0xFFFFFF) {
                 continue;
             }
 
@@ -874,6 +904,19 @@ void SPIDecoder::rebuild() {
     programmes.clear();
     programme_groups.clear();
 
+    const auto merge_group = [this](const ProgrammeGroup &group) {
+        const auto existing = std::ranges::find_if(programme_groups, [&](const auto &entry) {
+            return SPIGroupHelper::matches(group.id, group.short_id, entry.second.id, entry.second.short_id);
+        });
+
+        if (existing != programme_groups.end()) {
+            merge_programme_group(existing->second, group);
+        } else {
+            const std::string key = group.id.empty() ? std::format("short:{}", group.short_id) : group.id;
+            merge_programme_group(programme_groups[key], group);
+        }
+    };
+
     for (const auto &object: objects | std::views::values) {
         for (const auto &[key, service]: object.services) {
             merge_service_information(services[key], service);
@@ -884,8 +927,25 @@ void SPIDecoder::rebuild() {
         }
 
         for (const auto &[key, group]: object.programme_groups) {
-            merge_programme_group(programme_groups[key], group);
+            merge_group(group);
         }
+    }
+
+    std::vector<GroupMembership> memberships;
+
+    for (const auto &programme: programmes | std::views::values) {
+        merge_vector(memberships, programme.memberships);
+    }
+
+    for (const auto &group: programme_groups | std::views::values) {
+        merge_vector(memberships, group.memberships);
+    }
+
+    for (const auto &membership: memberships) {
+        ProgrammeGroup group;
+        group.id = membership.id;
+        group.short_id = membership.short_id;
+        merge_group(group);
     }
 }
 

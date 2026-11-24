@@ -13,6 +13,7 @@
 #include <tuple>
 #if DAB_ENABLE_SPI
 #include "../helper/logo_helper.h"
+#include "../helper/spi_group_helper.h"
 #endif
 #if DAB_ENABLE_AAC
 #include "../encoder/loas_encoder.h"
@@ -21,20 +22,31 @@
 
 namespace {
 constexpr auto SIGNAL_STATUS_INTERVAL = std::chrono::milliseconds(500);
+#if DAB_ENABLE_AUDIO
+constexpr auto AUDIO_SIGNAL_STATUS_INTERVAL = std::chrono::milliseconds(100);
+#endif
 #if DAB_ENABLE_DIAGNOSTICS && DAB_ENABLE_SLIDESHOW
 constexpr auto SLIDESHOW_STATISTICS_INTERVAL = std::chrono::milliseconds(250);
 #endif
 #if DAB_ENABLE_SCAN
 constexpr auto SCAN_SIGNAL_STATUS_INTERVAL = std::chrono::milliseconds(100);
-constexpr auto SCAN_NO_SIGNAL_TIMEOUT = std::chrono::milliseconds(900);
+constexpr auto SEEK_NO_SIGNAL_TIMEOUT = std::chrono::milliseconds(1200);
+constexpr auto SEEK_NO_ENSEMBLE_TIMEOUT = std::chrono::seconds(4);
+constexpr auto SEEK_METADATA_TIMEOUT = std::chrono::milliseconds(1200);
 #if DAB_ENABLE_FAST_SCAN
+constexpr auto FAST_SCAN_NO_SIGNAL_TIMEOUT = std::chrono::milliseconds(900);
 constexpr auto FAST_SCAN_NO_ENSEMBLE_TIMEOUT = std::chrono::milliseconds(1400);
 constexpr auto FAST_SCAN_LABEL_TIMEOUT = std::chrono::milliseconds(1200);
 #endif
 #if DAB_ENABLE_FULL_SCAN
-constexpr auto FULL_SCAN_NO_ENSEMBLE_TIMEOUT = std::chrono::milliseconds(1800);
-constexpr auto FULL_SCAN_ENSEMBLE_TIMEOUT = std::chrono::milliseconds(3000);
-constexpr auto FULL_SCAN_STABLE_TIME = std::chrono::milliseconds(400);
+constexpr auto FULL_SCAN_NO_SIGNAL_TIMEOUT = std::chrono::milliseconds(1200);
+constexpr auto FULL_SCAN_NO_FIC_TIMEOUT = std::chrono::seconds(3);
+constexpr auto FULL_SCAN_INVALID_FIC_TIMEOUT = std::chrono::seconds(5);
+constexpr auto FULL_SCAN_NO_ENSEMBLE_TIMEOUT = std::chrono::seconds(12);
+constexpr auto FULL_SCAN_ENSEMBLE_TIMEOUT = std::chrono::seconds(12);
+constexpr auto FULL_SCAN_MINIMUM_TIME = std::chrono::seconds(2);
+constexpr auto FULL_SCAN_FALLBACK_MINIMUM_TIME = std::chrono::seconds(4);
+constexpr auto FULL_SCAN_STABLE_TIME = std::chrono::seconds(1);
 #endif
 constexpr auto SCAN_RESTORE_TIMEOUT = std::chrono::seconds(4);
 #endif
@@ -874,6 +886,27 @@ std::vector<SPIDecoder::Programme> TunerHandler::get_schedule(const uint32_t ser
 
 
 #if DAB_ENABLE_SPI
+std::vector<SPIDecoder::Programme> TunerHandler::get_group_programmes(const std::string &group_id, const uint32_t short_id) const {
+    const std::lock_guard lock(state_mutex);
+    auto result = SPIGroupHelper::get_programmes(spi_programmes, spi_programme_groups, group_id, short_id);
+
+    for (auto &programme: result) {
+        for (auto &multimedia: programme.multimedia) {
+            for (const auto &asset: spi_assets | std::views::values) {
+                if (!multimedia.url.empty() && multimedia.url == asset.content_name) {
+                    multimedia.path = asset.path;
+                    break;
+                }
+            }
+        }
+    }
+
+    return result;
+}
+#endif
+
+
+#if DAB_ENABLE_SPI
 std::vector<SPIDecoder::ProgrammeGroup> TunerHandler::get_programme_groups() const {
     const std::lock_guard lock(state_mutex);
     auto result = spi_programme_groups;
@@ -1199,6 +1232,21 @@ TPEGDecoder::Status TunerHandler::get_tpeg_status() const {
 
 
 #if DAB_ENABLE_TPEG
+TPEGContentDecoder::Status TunerHandler::get_tpeg_content_status() const {
+    const std::lock_guard lock(state_mutex);
+    return tpeg_content_decoder.get_status();
+}
+
+std::vector<TPEGContentDecoder::Service> TunerHandler::get_tpeg_service_information() const {
+    const std::lock_guard lock(state_mutex);
+    return tpeg_content_decoder.get_services();
+}
+
+std::vector<TPEGContentDecoder::Message> TunerHandler::get_tpeg_messages() const {
+    const std::lock_guard lock(state_mutex);
+    return tpeg_content_decoder.get_messages();
+}
+
 std::vector<TPEGDecoder::ServiceIdentifier> TunerHandler::get_tpeg_services() const {
     const std::lock_guard lock(state_mutex);
     return tpeg_services;
@@ -1256,9 +1304,33 @@ std::string TunerHandler::get_scan_mode() const {
             return "full";
 #endif
 
+        case ScanMode::SeekUp:
+            return "seek_up";
+
+        case ScanMode::SeekDown:
+            return "seek_down";
+
         default:
             return {};
     }
+}
+#endif
+
+
+#if DAB_ENABLE_SCAN
+std::vector<std::string> TunerHandler::get_scan_modes() const {
+    std::vector<std::string> modes;
+#if DAB_ENABLE_FAST_SCAN
+    modes.emplace_back("fast");
+#endif
+#if DAB_ENABLE_FULL_SCAN
+    modes.emplace_back("full");
+#endif
+#if DAB_ENABLE_SEEK
+    modes.emplace_back("seek_up");
+    modes.emplace_back("seek_down");
+#endif
+    return modes;
 }
 #endif
 
@@ -1309,32 +1381,73 @@ bool TunerHandler::start_scan(const std::string &mode) {
         return false;
     }
 
-    bool expected = false;
+    return start_scan_mode(requested_mode);
+}
+#endif
 
-    if (!scan_active.compare_exchange_strong(expected, true)) {
-        logger.warning("Scan already active");
-        return false;
-    }
 
-    scan_stop_requested = false;
+#if DAB_ENABLE_SCAN
+bool TunerHandler::seek_up() {
+    return start_scan_mode(ScanMode::SeekUp);
+}
+#endif
+
+
+#if DAB_ENABLE_SCAN
+bool TunerHandler::seek_down() {
+    return start_scan_mode(ScanMode::SeekDown);
+}
+#endif
+
+
+#if DAB_ENABLE_SCAN
+bool TunerHandler::start_scan_mode(const ScanMode requested_mode) {
+    const bool seeking = requested_mode == ScanMode::SeekUp || requested_mode == ScanMode::SeekDown;
 
     {
         const std::lock_guard tuner_lock(tuner_mutex);
 
         {
             const std::lock_guard state_lock(state_mutex);
+
+            if (!initialized || scan_active.load()) {
+                logger.warning("Tuner unavailable or scan already active");
+                return false;
+            }
+
+            scan_stop_requested = false;
             scan_mode = requested_mode;
             scan_phase = ScanPhase::Tune;
             scan_state = "Scanning";
             scan_progress = {0, static_cast<uint16_t>(DAB_CHANNELS.size()), {}, 0};
-            scan_results.clear();
+
+            if (!seeking) {
+                scan_results.clear();
+            }
+
             scan_channel_index = 0;
+            scan_channels_checked = 0;
+
+            if (seeking) {
+                const auto current = get_dab_channel_index(frequency);
+                const size_t step = requested_mode == ScanMode::SeekUp ? 1 : DAB_CHANNELS.size() - 1;
+                scan_channel_index = current ? (*current + step) % DAB_CHANNELS.size() : requested_mode == ScanMode::SeekUp ? 0 : DAB_CHANNELS.size() - 1;
+            }
+
             scan_saved_frequency = frequency;
             scan_saved_service_id = current_service_id;
             scan_restore_service_id = 0;
             scan_ensemble_seen_valid = false;
+            scan_active = true;
+#if DAB_ENABLE_FULL_SCAN
+            scan_tune_retried = false;
+#endif
         }
 
+#if DAB_ENABLE_AUDIO
+        audio_mute.reset();
+        audio_pipe->discard_buffered();
+#endif
 #if DAB_ENABLE_AAC
         msc_decoder->reset();
 #endif
@@ -1363,18 +1476,7 @@ bool TunerHandler::start_scan(const std::string &mode) {
         }
     }
 
-    std::string_view scan_name;
-#if DAB_ENABLE_FAST_SCAN
-    if (requested_mode == ScanMode::Fast) {
-        scan_name = "Fast";
-    }
-#endif
-#if DAB_ENABLE_FULL_SCAN
-    if (requested_mode == ScanMode::Full) {
-        scan_name = "Full";
-    }
-#endif
-    logger.info(std::format("{} scan started", scan_name));
+    logger.info(std::format("{} started", get_scan_mode()));
     notify_property_changes({"State", "AudioCodec", "DataApplication", "DataPathStatistics", "SlideShow", "SlideShowItems", "SlideShowStatistics", "DLS", "DLP", "SPIRevision", "JournalineRevision", "JournalineStatus", "TPEGRevision", "TPEGStatus", "ScanState", "ScanMode", "ScanProgress", "ScanResults"});
     return true;
 }
@@ -1382,15 +1484,30 @@ bool TunerHandler::start_scan(const std::string &mode) {
 
 
 #if DAB_ENABLE_SCAN
+bool TunerHandler::stop_seek() {
+    return stop_scan_mode(true);
+}
+#endif
+
+
+#if DAB_ENABLE_SCAN
 bool TunerHandler::stop_scan() {
-    if (!scan_active.load()) {
-        return false;
-    }
+    return stop_scan_mode(false);
+}
+#endif
 
-    scan_stop_requested = true;
 
+#if DAB_ENABLE_SCAN
+bool TunerHandler::stop_scan_mode(const bool seek_only) {
     {
         const std::lock_guard lock(state_mutex);
+        const bool seeking = scan_mode == ScanMode::SeekUp || scan_mode == ScanMode::SeekDown;
+
+        if (!scan_active.load() || (seek_only && !seeking)) {
+            return false;
+        }
+
+        scan_stop_requested = true;
         scan_state = "Stopping";
     }
 
@@ -1420,6 +1537,10 @@ bool TunerHandler::tune_frequency(const uint32_t frequency, const bool notify_ch
     logger.info(std::format("Setting frequency to {} kHz", frequency));
 
     const std::lock_guard lock(tuner_mutex);
+#if DAB_ENABLE_AUDIO
+    audio_mute.reset();
+    audio_pipe->discard_buffered();
+#endif
     const bool result = helper->set_frequency(frequency);
 
     if (result) {
@@ -1467,6 +1588,9 @@ bool TunerHandler::tune_frequency(const uint32_t frequency, const bool notify_ch
         ensemble_short_label.clear();
         services.clear();
         service_components.clear();
+#if DAB_ENABLE_FULL_SCAN
+        scan_service_information_complete = false;
+#endif
 #if DAB_ENABLE_SCAN
         scan_restore_service_id = 0;
 #endif
@@ -1591,6 +1715,10 @@ bool TunerHandler::set_service(const uint16_t service_id) {
     }
 #endif
 
+#if DAB_ENABLE_AUDIO
+    audio_mute.reset();
+    audio_pipe->discard_buffered();
+#endif
 #if DAB_ENABLE_AAC
     msc_decoder->reset();
 #endif
@@ -1804,6 +1932,10 @@ bool TunerHandler::select_data_service(const uint32_t service_id, const bool dat
     }
 #endif
 
+#if DAB_ENABLE_AUDIO
+    audio_mute.reset();
+    audio_pipe->discard_buffered();
+#endif
 #if DAB_ENABLE_AAC
     msc_decoder->reset();
 #endif
@@ -1895,6 +2027,10 @@ bool TunerHandler::close_service() {
 #endif
 
     const std::lock_guard tuner_lock(tuner_mutex);
+#if DAB_ENABLE_AUDIO
+    audio_mute.reset();
+    audio_pipe->discard_buffered();
+#endif
 #if DAB_ENABLE_SPI
     bool audio_service_selected = false;
 
@@ -2019,7 +2155,7 @@ void TunerHandler::capture_scan_result() {
 
 
 #if DAB_ENABLE_SCAN
-void TunerHandler::finish_scan(const bool cancelled) {
+void TunerHandler::finish_scan(ScanOutcome outcome) {
     uint32_t restore_frequency = 0;
     uint16_t restore_service_id = 0;
     ScanMode completed_mode = ScanMode::None;
@@ -2031,17 +2167,40 @@ void TunerHandler::finish_scan(const bool cancelled) {
         completed_mode = scan_mode;
     }
 
+    const bool seeking = completed_mode == ScanMode::SeekUp || completed_mode == ScanMode::SeekDown;
     bool restored = false;
 
-    if (restore_frequency != 0) {
+    if (!seeking && restore_frequency != 0) {
         restored = tune_frequency(restore_frequency, false);
     }
 
     {
         const std::lock_guard lock(state_mutex);
         scan_phase = ScanPhase::Idle;
-        scan_state = cancelled ? "Cancelled" : "Completed";
-        scan_progress.current = cancelled ? scan_progress.current : scan_progress.total;
+
+        if (scan_stop_requested.load()) {
+            outcome = ScanOutcome::Cancelled;
+        }
+
+        switch (outcome) {
+            case ScanOutcome::Completed:
+                scan_state = "Completed";
+                break;
+            case ScanOutcome::Cancelled:
+                scan_state = "Cancelled";
+                break;
+            case ScanOutcome::NotFound:
+                scan_state = "NotFound";
+                break;
+            case ScanOutcome::Failed:
+                scan_state = "Failed";
+                break;
+        }
+
+        if (!seeking && outcome == ScanOutcome::Completed) {
+            scan_progress.current = scan_progress.total;
+        }
+
         scan_saved_frequency = 0;
         scan_saved_service_id = 0;
         scan_ensemble_seen_valid = false;
@@ -2052,23 +2211,12 @@ void TunerHandler::finish_scan(const bool cancelled) {
         } else {
             scan_restore_service_id = 0;
         }
+
+        scan_stop_requested = false;
+        scan_active = false;
     }
 
-    scan_stop_requested = false;
-    scan_active = false;
-
-    std::string_view scan_name;
-#if DAB_ENABLE_FAST_SCAN
-    if (completed_mode == ScanMode::Fast) {
-        scan_name = "Fast";
-    }
-#endif
-#if DAB_ENABLE_FULL_SCAN
-    if (completed_mode == ScanMode::Full) {
-        scan_name = "Full";
-    }
-#endif
-    logger.info(std::format("{} scan {} with {} ensemble{}", scan_name, cancelled ? "cancelled" : "completed", get_scan_results().size(), get_scan_results().size() == 1 ? "" : "s"));
+    logger.info(std::format("{} {} at {} kHz", get_scan_mode(), get_scan_state(), get_frequency()));
     notify_property_changes({"State", "Frequency", "SignalStatus", "DateTime", "Ensemble", "EnsembleStatus", "Services", "ServiceComponents", "SPIRevision", "DataApplication", "DataPathStatistics", "JournalineRevision", "JournalineStatus", "TPEGRevision", "TPEGStatus", "ServiceLinks", "FrequencyInformation", "OtherEnsembleServices", "OEAnnouncementSupport", "OEAnnouncementSwitches", "FMAnnouncementSupport", "FMAnnouncementSwitches", "FIDC", "EmergencyWarning", "Service", "AudioCodec", "SlideShow", "SlideShowItems", "SlideShowStatistics", "DLS", "DLP", "ScanState", "ScanMode", "ScanProgress", "ScanResults"});
 }
 #endif
@@ -2081,22 +2229,28 @@ void TunerHandler::scan_step() {
     }
 
     if (scan_stop_requested.load()) {
-        finish_scan(true);
+        finish_scan(ScanOutcome::Cancelled);
         return;
     }
 
     ScanPhase phase = ScanPhase::Idle;
+    ScanMode current_mode = ScanMode::None;
     size_t channel_index = 0;
+    size_t channels_checked = 0;
 
     {
         const std::lock_guard lock(state_mutex);
         phase = scan_phase;
+        current_mode = scan_mode;
         channel_index = scan_channel_index;
+        channels_checked = scan_channels_checked;
     }
 
+    const bool seeking = current_mode == ScanMode::SeekUp || current_mode == ScanMode::SeekDown;
+
     if (phase == ScanPhase::Tune) {
-        if (channel_index >= DAB_CHANNELS.size()) {
-            finish_scan(false);
+        if (channel_index >= DAB_CHANNELS.size() || (seeking && channels_checked >= DAB_CHANNELS.size())) {
+            finish_scan(seeking ? ScanOutcome::NotFound : ScanOutcome::Completed);
             return;
         }
 
@@ -2104,8 +2258,9 @@ void TunerHandler::scan_step() {
 
         {
             const std::lock_guard lock(state_mutex);
+            scan_channels_checked++;
             scan_progress = {
-                static_cast<uint16_t>(channel_index + 1),
+                static_cast<uint16_t>(seeking ? scan_channels_checked : channel_index + 1),
                 static_cast<uint16_t>(DAB_CHANNELS.size()),
                 std::string(channel.name),
                 channel.frequency
@@ -2116,9 +2271,17 @@ void TunerHandler::scan_step() {
         logger.debug(std::format("Scanning {} / {} kHz", channel.name, channel.frequency));
 
         if (!tune_frequency(channel.frequency, false)) {
+            if (seeking) {
+                finish_scan(ScanOutcome::Failed);
+                return;
+            }
+
             {
                 const std::lock_guard lock(state_mutex);
                 scan_channel_index++;
+#if DAB_ENABLE_FULL_SCAN
+                scan_tune_retried = false;
+#endif
             }
 
             return;
@@ -2151,6 +2314,12 @@ void TunerHandler::scan_step() {
     std::chrono::steady_clock::time_point ensemble_seen;
     std::chrono::steady_clock::time_point last_service_change;
     bool ensemble_seen_valid = false;
+#if DAB_ENABLE_FULL_SCAN
+    bool service_information_complete = false;
+    uint32_t fibs_received = 0;
+    uint32_t fibs_valid = 0;
+    bool tune_retried = false;
+#endif
 
     {
         const std::lock_guard lock(state_mutex);
@@ -2162,27 +2331,57 @@ void TunerHandler::scan_step() {
         ensemble_seen = scan_ensemble_seen;
         ensemble_seen_valid = scan_ensemble_seen_valid;
         last_service_change = scan_last_service_change;
+#if DAB_ENABLE_FULL_SCAN
+        service_information_complete = scan_service_information_complete;
+        fibs_received = fic_statistics.fibs_received;
+        fibs_valid = fic_statistics.fibs_valid;
+        tune_retried = scan_tune_retried;
+#endif
     }
 
     const auto elapsed = now - started;
     const bool ensemble_found = status.ensemble_id != 0;
-    const bool no_signal = !ensemble_found && elapsed >= SCAN_NO_SIGNAL_TIMEOUT && !current_signal_status.ofdm_lock;
-    bool channel_finished = no_signal;
-    std::string_view finish_reason = no_signal ? "no signal" : "";
+
+    if (seeking) {
+        const bool synced = current_signal_status.ofdm_lock && current_signal_status.fec_lock && current_signal_status.fec_sync;
+        const bool metadata_received = !current_ensemble_label.empty() && status.services_found >= status.service_count;
+        const bool metadata_timeout = ensemble_seen_valid && now - ensemble_seen >= SEEK_METADATA_TIMEOUT;
+
+        if (ensemble_found && synced && (metadata_received || metadata_timeout)) {
+            finish_scan(ScanOutcome::Completed);
+        } else if ((!ensemble_found && !current_signal_status.ofdm_lock && elapsed >= SEEK_NO_SIGNAL_TIMEOUT) || elapsed >= SEEK_NO_ENSEMBLE_TIMEOUT) {
+            const std::lock_guard lock(state_mutex);
+            const size_t step = mode == ScanMode::SeekUp ? 1 : DAB_CHANNELS.size() - 1;
+            scan_channel_index = (scan_channel_index + step) % DAB_CHANNELS.size();
+            scan_phase = ScanPhase::Tune;
+        }
+
+        return;
+    }
+
+    bool channel_finished = false;
+    std::string_view finish_reason;
+#if DAB_ENABLE_FULL_SCAN
+    const bool valid_fic_received = fibs_valid >= 2;
+#endif
 
 #if DAB_ENABLE_FAST_SCAN
     if (mode == ScanMode::Fast) {
+        const bool no_signal = !ensemble_found && elapsed >= FAST_SCAN_NO_SIGNAL_TIMEOUT && !current_signal_status.ofdm_lock;
         const bool label_received = !current_ensemble_label.empty();
         const bool label_timeout = ensemble_found && ensemble_seen_valid && now - ensemble_seen >= FAST_SCAN_LABEL_TIMEOUT;
         const bool no_ensemble_timeout = !ensemble_found && elapsed >= FAST_SCAN_NO_ENSEMBLE_TIMEOUT;
 
-        if (!channel_finished && ensemble_found && label_received) {
+        if (no_signal) {
+            channel_finished = true;
+            finish_reason = "no signal";
+        } else if (ensemble_found && label_received) {
             channel_finished = true;
             finish_reason = "ensemble label received";
-        } else if (!channel_finished && label_timeout) {
+        } else if (label_timeout) {
             channel_finished = true;
             finish_reason = "ensemble label timeout";
-        } else if (!channel_finished && no_ensemble_timeout) {
+        } else if (no_ensemble_timeout) {
             channel_finished = true;
             finish_reason = "ensemble timeout";
         }
@@ -2190,18 +2389,25 @@ void TunerHandler::scan_step() {
 #endif
 #if DAB_ENABLE_FULL_SCAN
     if (mode == ScanMode::Full) {
-        const bool service_information_complete = status.service_count != 0 && status.services_found >= status.service_count;
+        const bool no_signal = !ensemble_found && elapsed >= FULL_SCAN_NO_SIGNAL_TIMEOUT && !current_signal_status.ofdm_lock && fibs_received == 0;
+        const auto unconfirmed_timeout = fibs_received != 0 ? FULL_SCAN_INVALID_FIC_TIMEOUT : FULL_SCAN_NO_FIC_TIMEOUT;
+        const auto acquisition_timeout = valid_fic_received ? FULL_SCAN_NO_ENSEMBLE_TIMEOUT : unconfirmed_timeout;
+        const auto minimum_time = status.service_count == 0 ? FULL_SCAN_FALLBACK_MINIMUM_TIME : FULL_SCAN_MINIMUM_TIME;
+        const bool minimum_time_elapsed = ensemble_seen_valid && now - ensemble_seen >= minimum_time;
         const bool service_information_stable = now - last_service_change >= FULL_SCAN_STABLE_TIME;
         const bool ensemble_timeout = ensemble_found && ensemble_seen_valid && now - ensemble_seen >= FULL_SCAN_ENSEMBLE_TIMEOUT;
-        const bool no_ensemble_timeout = !ensemble_found && elapsed >= FULL_SCAN_NO_ENSEMBLE_TIMEOUT;
+        const bool no_ensemble_timeout = !ensemble_found && elapsed >= acquisition_timeout;
 
-        if (!channel_finished && ensemble_found && service_information_complete && service_information_stable) {
+        if (no_signal) {
+            channel_finished = true;
+            finish_reason = "no signal";
+        } else if (ensemble_found && service_information_complete && service_information_stable && minimum_time_elapsed) {
             channel_finished = true;
             finish_reason = "service information complete";
-        } else if (!channel_finished && ensemble_timeout) {
+        } else if (ensemble_timeout) {
             channel_finished = true;
             finish_reason = "service information timeout";
-        } else if (!channel_finished && no_ensemble_timeout) {
+        } else if (no_ensemble_timeout) {
             channel_finished = true;
             finish_reason = "ensemble timeout";
         }
@@ -2211,6 +2417,16 @@ void TunerHandler::scan_step() {
     if (!channel_finished) {
         return;
     }
+
+#if DAB_ENABLE_FULL_SCAN
+    if (mode == ScanMode::Full && !ensemble_found && valid_fic_received && !tune_retried) {
+        logger.debug(std::format("Retrying scan channel {} after {}", DAB_CHANNELS[channel_index].name, finish_reason));
+        const std::lock_guard lock(state_mutex);
+        scan_tune_retried = true;
+        scan_phase = ScanPhase::Tune;
+        return;
+    }
+#endif
 
     logger.debug(std::format("Scan channel {} finished: {}", DAB_CHANNELS[channel_index].name, finish_reason));
 
@@ -2224,11 +2440,14 @@ void TunerHandler::scan_step() {
         const std::lock_guard lock(state_mutex);
         scan_channel_index++;
         scan_phase = ScanPhase::Tune;
+#if DAB_ENABLE_FULL_SCAN
+        scan_tune_retried = false;
+#endif
         complete = scan_channel_index >= DAB_CHANNELS.size();
     }
 
     if (complete) {
-        finish_scan(false);
+        finish_scan(ScanOutcome::Completed);
     }
 }
 #endif
@@ -2288,25 +2507,45 @@ void TunerHandler::handle() {
 
     while (running) {
         const auto now = std::chrono::steady_clock::now();
-#if DAB_ENABLE_SCAN
-        const auto signal_status_interval = scan_active.load() ? SCAN_SIGNAL_STATUS_INTERVAL : SIGNAL_STATUS_INTERVAL;
-#else
-        const auto signal_status_interval = SIGNAL_STATUS_INTERVAL;
+        auto signal_status_interval = SIGNAL_STATUS_INTERVAL;
+#if DAB_ENABLE_AUDIO
+        if (audio_codec.load() != AudioCodec::None) {
+            signal_status_interval = AUDIO_SIGNAL_STATUS_INTERVAL;
+        }
 #endif
-        const bool read_signal_status = now >= next_signal_status || next_signal_status > now + signal_status_interval;
+#if DAB_ENABLE_SCAN
+        if (scan_active.load()) {
+            signal_status_interval = SCAN_SIGNAL_STATUS_INTERVAL;
+        }
+#endif
+        bool read_signal_status = false;
         TunerHelper::SignalStatus hardware_signal_status;
         int usb_error = LIBUSB_SUCCESS;
 
         {
             const std::lock_guard lock(tuner_mutex);
             const auto operation = helper->begin_operation(TunerHelper::RECEIVE_TIMEOUT);
-            helper->read_data();
+            const auto signal_time = std::chrono::steady_clock::now();
+            read_signal_status = signal_time >= next_signal_status || next_signal_status > signal_time + signal_status_interval;
 
-            if (read_signal_status && operation.succeeded()) {
+            if (read_signal_status) {
                 hardware_signal_status = helper->get_signal_status();
+#if DAB_ENABLE_AUDIO
+                const bool locked = hardware_signal_status.ofdm_lock && hardware_signal_status.fec_lock && hardware_signal_status.fec_sync;
+                audio_mute.update(locked, hardware_signal_status.msc_cer_valid, hardware_signal_status.msc_cer, std::chrono::steady_clock::now());
+#endif
+            }
+
+            if (operation.succeeded()) {
+                helper->read_data();
             }
 
             usb_error = helper->take_usb_error();
+#if DAB_ENABLE_AUDIO
+            if (usb_error != LIBUSB_SUCCESS) {
+                audio_mute.reset();
+            }
+#endif
 #if DAB_ENABLE_AUDIO && DAB_ENABLE_DIAGNOSTICS
             update_audio_statistics();
 #endif
@@ -2379,6 +2618,9 @@ void TunerHandler::fic_data_event(const std::vector<uint8_t> &data) {
 
     fic_decoder->process(data);
     const auto new_statistics = fic_decoder->get_statistics();
+#if DAB_ENABLE_FULL_SCAN
+    const bool new_service_information_complete = fic_decoder->is_service_information_complete();
+#endif
 #if DAB_ENABLE_SERVICE_LINKING
     const auto new_service_links = fic_decoder->get_service_links();
     const auto new_other_ensemble_services = fic_decoder->get_other_ensemble_services();
@@ -2411,6 +2653,13 @@ void TunerHandler::fic_data_event(const std::vector<uint8_t> &data) {
     {
         const std::lock_guard lock(state_mutex);
         fic_statistics = new_statistics;
+#if DAB_ENABLE_FULL_SCAN
+        if (scan_active.load() && scan_service_information_complete != new_service_information_complete) {
+            scan_last_service_change = std::chrono::steady_clock::now();
+        }
+
+        scan_service_information_complete = new_service_information_complete;
+#endif
 #if DAB_ENABLE_SERVICE_LINKING
         service_links_changed = service_links != new_service_links;
         other_ensemble_services_changed = other_ensemble_services != new_other_ensemble_services;
@@ -2533,6 +2782,10 @@ void TunerHandler::msc_data_event(const std::vector<uint8_t> &data) {
 
 #if DAB_ENABLE_AAC
 void TunerHandler::access_unit_event(const MSCDecoder::AccessUnit &access_unit) const {
+    if (!audio_service_active || audio_codec.load() != AudioCodec::AAC || audio_mute.is_muted()) {
+        return;
+    }
+
     audio_pipe->write(LOASEncoder::encode(access_unit.data, access_unit.sampling_rate, access_unit.channels, access_unit.sbr));
 }
 #endif
@@ -2540,6 +2793,10 @@ void TunerHandler::access_unit_event(const MSCDecoder::AccessUnit &access_unit) 
 
 #if DAB_ENABLE_MP2
 void TunerHandler::mp2_frame_event(const MP2Decoder::Frame &frame) const {
+    if (!audio_service_active || audio_codec.load() != AudioCodec::MP2 || audio_mute.is_muted()) {
+        return;
+    }
+
     audio_pipe->write(frame.data);
 }
 #endif
@@ -2873,13 +3130,7 @@ void TunerHandler::tpeg_update_event(const TPEGDecoder::Status &status, const st
 
     {
         const std::lock_guard lock(state_mutex);
-        status_changed = tpeg_status.group_crc_errors != status.group_crc_errors ||
-                         tpeg_status.transport_crc_errors != status.transport_crc_errors ||
-                         tpeg_status.directory_crc_errors != status.directory_crc_errors ||
-                         tpeg_status.component_crc_errors != status.component_crc_errors ||
-                         tpeg_status.continuity_errors != status.continuity_errors ||
-                         tpeg_status.malformed_frames != status.malformed_frames ||
-                         tpeg_status.service_count != status.service_count;
+        status_changed = tpeg_status != status;
         const bool services_changed = tpeg_services != services;
         tpeg_status = status;
         tpeg_services = services;
@@ -2905,6 +3156,7 @@ void TunerHandler::tpeg_update_event(const TPEGDecoder::Status &status, const st
 #if DAB_ENABLE_TPEG
 void TunerHandler::tpeg_frame_event(const TPEGDecoder::Frame &frame) {
     const std::lock_guard lock(state_mutex);
+    tpeg_content_decoder.process_frame(frame);
     tpeg_frames.push_back(frame);
 
     if (tpeg_frames.size() > TPEG_FRAME_HISTORY) {
@@ -3160,6 +3412,11 @@ void TunerHandler::ensemble_data_event(const FICDecoder::Ensemble &ensemble) {
         const std::lock_guard lock(state_mutex);
         ensemble_label = ensemble.label;
         ensemble_short_label = ensemble.short_label;
+#if DAB_ENABLE_SCAN
+        if (scan_active.load()) {
+            scan_last_service_change = std::chrono::steady_clock::now();
+        }
+#endif
     }
 
     fic_logger.info(std::format("Ensemble 0x{:04X}: {}", ensemble.id, ensemble.label));
@@ -3248,7 +3505,7 @@ void TunerHandler::service_data_event(const FICDecoder::Service &service) {
         services[service.id] = service;
 
 #if DAB_ENABLE_SCAN
-        if (scan_active.load() && new_service) {
+        if (scan_active.load()) {
             scan_last_service_change = std::chrono::steady_clock::now();
         }
 #endif
@@ -3633,6 +3890,9 @@ bool TunerHandler::recover_hardware(const std::string &reason) {
     {
         const std::lock_guard lock(tuner_mutex);
         const auto operation = helper->begin_operation(TunerHelper::RECOVERY_TIMEOUT);
+#if DAB_ENABLE_AUDIO
+        audio_mute.reset();
+#endif
 
 #if DAB_ENABLE_BACKGROUND_DATA
         stop_background_data();
@@ -3846,7 +4106,19 @@ void TunerHandler::handle_usb_error(const int error) {
 #if DAB_ENABLE_SCAN
     if (scan_active.load()) {
         logger.warning(std::format("Repeated USB errors during scan: {}", libusb_error_name(error)));
-        scan_stop_requested = true;
+        bool seeking = false;
+
+        {
+            const std::lock_guard lock(state_mutex);
+            seeking = scan_mode == ScanMode::SeekUp || scan_mode == ScanMode::SeekDown;
+        }
+
+        if (seeking) {
+            finish_scan(ScanOutcome::Failed);
+        } else {
+            scan_stop_requested = true;
+        }
+
         return;
     }
 #endif
@@ -4304,6 +4576,7 @@ void TunerHandler::reset_tpeg() {
 
     const std::lock_guard lock(state_mutex);
     tpeg_frame_dirty = false;
+    tpeg_content_decoder.reset();
 
     if (!tpeg_frames.empty()) {
         tpeg_frames.clear();
