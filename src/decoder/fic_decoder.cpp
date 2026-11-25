@@ -185,7 +185,6 @@ FICDecoder::Statistics FICDecoder::get_statistics() const {
     return statistics;
 }
 
-#if DAB_ENABLE_FULL_SCAN
 bool FICDecoder::is_service_information_complete() const {
     if (!ensemble_valid || ensemble.id != ensemble_status.ensemble_id || ensemble.label.empty() || configuration_cleanup_pending || service_ids.empty() || service_ids.size() < ensemble_status.service_count) {
         return false;
@@ -237,7 +236,6 @@ bool FICDecoder::is_service_information_complete() const {
 
     return true;
 }
-#endif
 
 #if DAB_ENABLE_SERVICE_LINKING
 std::vector<FICDecoder::ServiceLink> FICDecoder::get_service_links() const {

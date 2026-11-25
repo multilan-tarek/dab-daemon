@@ -28,6 +28,7 @@ using DBusSPIObject = sdbus::Struct<uint16_t, uint32_t, uint8_t, uint16_t, std::
 using DBusSlideShowItem = sdbus::Struct<uint16_t, std::string, std::string, bool, bool, int64_t, bool, int64_t, uint8_t, uint8_t, std::string, std::string, std::string, uint8_t, bool>;
 #endif
 
+using DBusEnsemble = sdbus::Struct<std::string, uint32_t, uint16_t, uint8_t, std::string, std::string, std::vector<DBusService>>;
 using DBusBandIIIChannel = sdbus::Struct<std::string, uint32_t>;
 #if DAB_ENABLE_DIAGNOSTICS
 using DBusFICFigure = sdbus::Struct<uint64_t, int64_t, uint8_t, int16_t, uint8_t, std::string, std::string, std::vector<uint8_t>, std::vector<sdbus::Struct<std::string, std::string>>>;
@@ -185,7 +186,7 @@ constexpr std::string_view DIAGNOSTICS_INTERFACE = "de.multilan.dabdaemon.Diagno
 #endif
 
 std::string_view interface_for_property(const std::string_view property) {
-    if (property == "State" || property == "Frequency" || property == "BandIIIChannels" || property == "Ensemble" || property == "EnsembleStatus" || property == "Services" || property == "ServiceComponents" || property == "Service") {
+    if (property == "State" || property == "Frequency" || property == "BandIIIChannels" || property == "Ensemble" || property == "Ensembles" || property == "ServicesReady" || property == "EnsembleStatus" || property == "Services" || property == "ServiceComponents" || property == "Service") {
         return TUNER_INTERFACE;
     }
 
@@ -402,6 +403,20 @@ DBusHandler::DBusHandler(const int id, const std::unique_ptr<sdbus::IConnection>
         }).withUpdateBehavior(sdbus::Flags::CONST_PROPERTY_VALUE),
         sdbus::registerProperty("Ensemble").withGetter([this]() {
             return this->tuner_handler->get_ensemble();
+        }),
+        sdbus::registerProperty("Ensembles").withGetter([this]() {
+            std::vector<DBusEnsemble> result;
+            for (const auto &ensemble: this->tuner_handler->get_ensembles()) {
+                std::vector<DBusService> services;
+                for (const auto &service: ensemble.services) {
+                    services.emplace_back(make_dbus_service(service));
+                }
+                result.emplace_back(make_dbus_struct(ensemble.channel, ensemble.frequency, ensemble.ensemble_id, ensemble.ecc, ensemble.label, ensemble.short_label, services));
+            }
+            return result;
+        }),
+        sdbus::registerProperty("ServicesReady").withGetter([this]() {
+            return this->tuner_handler->get_services_ready();
         }),
         sdbus::registerProperty("EnsembleStatus").withGetter([this]() {
             const auto status = this->tuner_handler->get_ensemble_status();
@@ -1059,10 +1074,16 @@ void DBusHandler::property_change_event(const std::vector<std::string> &properti
 
 void DBusHandler::emit_pending_property_changes() {
     std::set<std::string> properties;
+    const auto revision = tuner_handler->get_ensembles_revision();
+    if (revision != ensembles_revision) {
+        ensembles_revision = revision;
+        properties.emplace("Ensembles");
+    }
 
     {
         const std::lock_guard lock(pending_properties_mutex);
-        properties.swap(pending_properties);
+        properties.insert(pending_properties.begin(), pending_properties.end());
+        pending_properties.clear();
     }
 
     if (properties.empty()) {

@@ -40,6 +40,8 @@ set(DAB_SOURCES
         src/config/features.h
         src/helper/tuner_helper.cpp
         src/helper/tuner_helper.h
+        src/helper/ensemble_cache.cpp
+        src/helper/ensemble_cache.h
         src/helper/signal_quality_filter.cpp
         src/helper/signal_quality_filter.h
         src/helper/signal_metrics.h

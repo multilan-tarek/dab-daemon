@@ -82,11 +82,13 @@ Always present. `DataApplication` and `SetDataService` require SPI, Journaline o
 | `BandIIIChannels` | [BandIIIChannel[]](dbus-types.md#bandiiichannel) | Supported channel names and frequencies in kHz. |
 | `DataApplication` | `s` | Active data application: SPI, Journaline, TPEG, or an empty string. |
 | `Ensemble` | `as` | Three strings in order: channel, ensemble label, short label. |
+| `Ensembles` | [EnsembleEntry[]](dbus-types.md#ensembleentry) | Persistent database of known ensembles and their stations. |
 | `EnsembleStatus` | [EnsembleStatus](dbus-types.md#ensemblestatus) | Ensemble identity, service counts, alarms, time offset, and change signalling. |
 | `Frequency` | `u` | Tuned frequency in kHz. |
 | `Service` | [Service](dbus-types.md#service) | Selected radio station; ID zero means no radio station is selected. |
 | `ServiceComponents` | [ServiceComponent[]](dbus-types.md#servicecomponent) | Programme/data components, packet parameters, and user applications. |
-| `Services` | [Service[]](dbus-types.md#service) | Programme services in the current ensemble, including local logo paths. |
+| `Services` | [Service[]](dbus-types.md#service) | Last complete station list of the current ensemble, including local logo paths. |
+| `ServicesReady` | `b` | Current station data is complete and stable. |
 | `State` | `s` | Initializing, Error, Disconnected, Idle, Tuned, Playing, Receiving, or Scanning. |
 
 | Method | Arguments | Returns | Action |
@@ -96,6 +98,19 @@ Always present. `DataApplication` and `SetDataService` require SPI, Journaline o
 | `SetEnsemble` | `ensemble: s` | `success: b` | Tune a Band III channel name, for example 5C. |
 | `SetFrequency` | `frequency_khz: u` | `success: b` | Tune a frequency in kHz; clears the current station selection. |
 | `SetService` | `service_id: q` | `success: b` | Select a programme service ID from Services on the tuned ensemble. |
+
+`Ensembles` is shared by all tuners and stored in
+`$XDG_CACHE_HOME/dab-daemon/ensembles.cache`, or
+`~/.cache/dab-daemon/ensembles.cache`. It is loaded when a tuner is created.
+
+Normal reception and scans update the same database. Ensemble metadata can
+arrive first; stations are replaced together once `ServicesReady` is true.
+Partial reception and fast scans keep previously known stations of the same ensemble.
+A confirmed new list also removes stations that are no longer present.
+
+Tuning clears `Services` and resets `ServicesReady`. The stored `Ensembles`
+remain available. Clients can display the selected ensemble's stored stations
+while acquisition completes. `ScanResults` remains separate and is not persisted.
 
 ## Signal1
 

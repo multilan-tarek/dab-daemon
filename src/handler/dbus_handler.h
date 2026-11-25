@@ -41,6 +41,7 @@ private:
     std::deque<Command> commands;
     std::thread command_thread;
     bool commands_running = true;
+    uint64_t ensembles_revision = 0;
     Logger logger{"DBUS"};
 
     void property_change_event(const std::vector<std::string> &properties);

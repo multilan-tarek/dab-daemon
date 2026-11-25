@@ -28,6 +28,23 @@ Signature: `(qssyybqsssasass)`
 
 Scan results have an empty `logo_path`.
 
+## EnsembleEntry
+
+Signature: `(suqyssa(qssyybqsssasass))`
+
+| Position | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| 0 | `channel` | `s` | Band III channel |
+| 1 | `frequency` | `u` | Frequency in kHz |
+| 2 | `ensemble_id` | `q` | Ensemble ID |
+| 3 | `ecc` | `y` | Ensemble ECC |
+| 4 | `label` | `s` | Ensemble name |
+| 5 | `short_label` | `s` | Short name |
+| 6 | `services` | `a(qssyybqsssasass)` | Last complete [Service](#service) list; empty if not yet known |
+
+Station data is replaced only after complete reception. Stored service records
+have an empty `logo_path`; the current `Service` and `Services` provide resolved logo paths.
+
 ## EnsembleStatus
 
 Signature: `(qyyybbyqqynby)`

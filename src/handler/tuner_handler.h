@@ -50,6 +50,7 @@
 #include "../helper/audio_mute.h"
 #endif
 #include "../helper/dab_channels.h"
+#include "../helper/ensemble_cache.h"
 #include "../helper/signal_quality_filter.h"
 #include "../helper/tuner_helper.h"
 #include "../helper/logger.h"
@@ -181,17 +182,7 @@ public:
 
 
 #if DAB_ENABLE_SCAN
-    struct ScanResult {
-        std::string channel;
-        uint32_t frequency = 0;
-        uint16_t ensemble_id = 0;
-        uint8_t ecc = 0;
-        std::string label;
-        std::string short_label;
-        std::vector<FICDecoder::Service> services;
-
-        bool operator==(const ScanResult &other) const = default;
-    };
+    using ScanResult = EnsembleCache::Ensemble;
 #endif
 
 
@@ -257,6 +248,12 @@ public:
     DynamicLabelPlus get_dlp() const;
 
     std::vector<std::string> get_ensemble() const;
+
+    std::vector<EnsembleCache::Ensemble> get_ensembles() const;
+
+    uint64_t get_ensembles_revision() const;
+
+    bool get_services_ready() const;
 
     std::vector<FICDecoder::Service> get_services() const;
 
@@ -520,7 +517,12 @@ private:
     std::string ensemble;
     std::string ensemble_label;
     std::string ensemble_short_label;
+    EnsembleCache ensemble_cache;
     std::map<uint16_t, FICDecoder::Service> services;
+    std::vector<FICDecoder::Service> published_services;
+    bool services_ready = false;
+    std::chrono::steady_clock::time_point ensemble_acquired;
+    std::chrono::steady_clock::time_point last_service_change;
     std::map<uint64_t, FICDecoder::ServiceComponent> service_components;
 #if DAB_ENABLE_SERVICE_LINKING
     std::vector<FICDecoder::ServiceLink> service_links;
@@ -642,6 +644,8 @@ private:
 #if DAB_ENABLE_DIAGNOSTICS
     void record_data_received();
 #endif
+
+    void update_ensemble_database();
 
     void fic_data_event(const std::vector<uint8_t> &data);
 

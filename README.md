@@ -19,6 +19,7 @@ A demo application can be found in the `tools` folder.
 - Ensemble, service and component discovery
 - SPI service information and program schedules
 - Automatic SPI reception alongside audio
+- Persistent ensemble and station database
 - Station logos with caching
 - TPEG service information, TEC traffic events and TFP traffic flow matrices
 - TMC location references and raw TPEG transport frame inspection
@@ -73,6 +74,7 @@ The selected service should play after a short moment.
 
 The daemon is available on the session bus as `de.multilan.dabdaemon`.\
 Each receiver has its own tuner object for tuning, scans, broadcast data and audio output through a FIFO.
+`Ensembles` keeps known stations across restarts and updates during scans and normal reception.
 State changes are reported through property updates.
 
 [API reference](docs/dbus-api.md) · [Data types](docs/dbus-types.md)

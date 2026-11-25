@@ -274,7 +274,8 @@ bool is_background_data_component(const FICDecoder::ServiceComponent &component,
 
 }
 
-TunerHandler::TunerHandler(const int id, libusb_device_handle *device_handle) {
+TunerHandler::TunerHandler(const int id, libusb_device_handle *device_handle)
+    : ensemble_cache(id) {
     logger.set_id(id);
     fic_logger.set_id(id);
     msc_logger.set_id(id);
@@ -443,7 +444,7 @@ void TunerHandler::notify_property_changes(const std::initializer_list<std::stri
 
     for (const std::string_view property: properties) {
 #if DAB_ENABLE_SCAN
-        if (scanning && property != "State" && !property.starts_with("Scan")) {
+        if (scanning && property != "State" && property != "Ensembles" && property != "ServicesReady" && property != "Services" && !property.starts_with("Scan")) {
             continue;
         }
 #endif
@@ -688,17 +689,24 @@ std::vector<std::string> TunerHandler::get_ensemble() const {
     return {ensemble, ensemble_label, ensemble_short_label};
 }
 
+std::vector<EnsembleCache::Ensemble> TunerHandler::get_ensembles() const {
+    return ensemble_cache.get_ensembles();
+}
+
+uint64_t TunerHandler::get_ensembles_revision() const {
+    return ensemble_cache.get_revision();
+}
+
+bool TunerHandler::get_services_ready() const {
+    const std::lock_guard lock(state_mutex);
+    return services_ready;
+}
+
 std::vector<FICDecoder::Service> TunerHandler::get_services() const {
     const std::lock_guard lock(state_mutex);
-    std::vector<FICDecoder::Service> result;
-    result.reserve(services.size());
-
-    for (const auto &service: services | std::views::values) {
-        result.push_back(service);
-    }
-
-    return result;
+    return published_services;
 }
+
 
 std::vector<FICDecoder::ServiceComponent> TunerHandler::get_service_components() const {
     const std::lock_guard lock(state_mutex);
@@ -1587,6 +1595,10 @@ bool TunerHandler::tune_frequency(const uint32_t frequency, const bool notify_ch
         ensemble_label.clear();
         ensemble_short_label.clear();
         services.clear();
+        published_services.clear();
+        services_ready = false;
+        ensemble_acquired = {};
+        last_service_change = std::chrono::steady_clock::now();
         service_components.clear();
 #if DAB_ENABLE_FULL_SCAN
         scan_service_information_complete = false;
@@ -1615,7 +1627,7 @@ bool TunerHandler::tune_frequency(const uint32_t frequency, const bool notify_ch
     }
 
     if (result && notify_changes) {
-        notify_property_changes({"State", "Frequency", "SignalStatus", "DateTime", "Ensemble", "EnsembleStatus", "Services", "ServiceComponents", "SPIRevision", "DataApplication", "DataPathStatistics", "JournalineRevision", "JournalineStatus", "TPEGRevision", "TPEGStatus", "ServiceLinks", "FrequencyInformation", "OtherEnsembleServices", "OEAnnouncementSupport", "OEAnnouncementSwitches", "FMAnnouncementSupport", "FMAnnouncementSwitches", "FIDC", "EmergencyWarning", "Service", "AudioCodec", "SlideShow", "SlideShowItems", "SlideShowStatistics", "DLS", "DLP"});
+        notify_property_changes({"State", "Frequency", "SignalStatus", "DateTime", "Ensemble", "EnsembleStatus", "Services", "ServicesReady", "ServiceComponents", "SPIRevision", "DataApplication", "DataPathStatistics", "JournalineRevision", "JournalineStatus", "TPEGRevision", "TPEGStatus", "ServiceLinks", "FrequencyInformation", "OtherEnsembleServices", "OEAnnouncementSupport", "OEAnnouncementSwitches", "FMAnnouncementSupport", "FMAnnouncementSwitches", "FIDC", "EmergencyWarning", "Service", "AudioCodec", "SlideShow", "SlideShowItems", "SlideShowStatistics", "DLS", "DLP"});
     }
 
     return result;
@@ -2217,7 +2229,7 @@ void TunerHandler::finish_scan(ScanOutcome outcome) {
     }
 
     logger.info(std::format("{} {} at {} kHz", get_scan_mode(), get_scan_state(), get_frequency()));
-    notify_property_changes({"State", "Frequency", "SignalStatus", "DateTime", "Ensemble", "EnsembleStatus", "Services", "ServiceComponents", "SPIRevision", "DataApplication", "DataPathStatistics", "JournalineRevision", "JournalineStatus", "TPEGRevision", "TPEGStatus", "ServiceLinks", "FrequencyInformation", "OtherEnsembleServices", "OEAnnouncementSupport", "OEAnnouncementSwitches", "FMAnnouncementSupport", "FMAnnouncementSwitches", "FIDC", "EmergencyWarning", "Service", "AudioCodec", "SlideShow", "SlideShowItems", "SlideShowStatistics", "DLS", "DLP", "ScanState", "ScanMode", "ScanProgress", "ScanResults"});
+    notify_property_changes({"State", "Frequency", "SignalStatus", "DateTime", "Ensemble", "EnsembleStatus", "Services", "ServicesReady", "ServiceComponents", "SPIRevision", "DataApplication", "DataPathStatistics", "JournalineRevision", "JournalineStatus", "TPEGRevision", "TPEGStatus", "ServiceLinks", "FrequencyInformation", "OtherEnsembleServices", "OEAnnouncementSupport", "OEAnnouncementSwitches", "FMAnnouncementSupport", "FMAnnouncementSwitches", "FIDC", "EmergencyWarning", "Service", "AudioCodec", "SlideShow", "SlideShowItems", "SlideShowStatistics", "DLS", "DLP", "ScanState", "ScanMode", "ScanProgress", "ScanResults"});
 }
 #endif
 
@@ -2605,6 +2617,44 @@ void TunerHandler::record_data_received() {
 }
 #endif
 
+void TunerHandler::update_ensemble_database() {
+    EnsembleCache::Ensemble entry;
+    const auto now = std::chrono::steady_clock::now();
+    const bool complete = fic_decoder->is_service_information_complete();
+    bool ready = false;
+    bool published_changed = false;
+
+    {
+        const std::lock_guard lock(state_mutex);
+        if (ensemble_status.ensemble_id == 0 || frequency == 0) {
+            return;
+        }
+        entry = {ensemble, frequency, ensemble_status.ensemble_id, ensemble_status.ecc, ensemble_label, ensemble_short_label, {}};
+        const auto minimum_time = ensemble_status.service_count == 0 ? std::chrono::seconds(4) : std::chrono::seconds(2);
+        ready = complete && ensemble_status.ecc != 0 && now - ensemble_acquired >= minimum_time && now - last_service_change >= std::chrono::seconds(1);
+        if (ready) {
+            for (const auto &service: services | std::views::values) {
+                entry.services.push_back(service);
+            }
+        }
+    }
+
+    const bool database_changed = ensemble_cache.update(entry, ready);
+    {
+        const std::lock_guard lock(state_mutex);
+        published_changed = services_ready != ready || (ready && published_services != entry.services);
+        services_ready = ready;
+        if (ready) {
+            published_services = std::move(entry.services);
+        }
+    }
+    if (published_changed) {
+        notify_property_changes({"Ensembles", "Services", "ServicesReady"});
+    } else if (database_changed) {
+        notify_property_changes({"Ensembles"});
+    }
+}
+
 void TunerHandler::fic_data_event(const std::vector<uint8_t> &data) {
 #if DAB_ENABLE_DIAGNOSTICS
     if (!data.empty()) {
@@ -2617,6 +2667,7 @@ void TunerHandler::fic_data_event(const std::vector<uint8_t> &data) {
     }
 
     fic_decoder->process(data);
+    update_ensemble_database();
     const auto new_statistics = fic_decoder->get_statistics();
 #if DAB_ENABLE_FULL_SCAN
     const bool new_service_information_complete = fic_decoder->is_service_information_complete();
@@ -3412,6 +3463,7 @@ void TunerHandler::ensemble_data_event(const FICDecoder::Ensemble &ensemble) {
         const std::lock_guard lock(state_mutex);
         ensemble_label = ensemble.label;
         ensemble_short_label = ensemble.short_label;
+        last_service_change = std::chrono::steady_clock::now();
 #if DAB_ENABLE_SCAN
         if (scan_active.load()) {
             scan_last_service_change = std::chrono::steady_clock::now();
@@ -3430,6 +3482,14 @@ void TunerHandler::ensemble_status_data_event(const FICDecoder::EnsembleStatus &
         const std::lock_guard lock(state_mutex);
         previous_status = this->ensemble_status;
         this->ensemble_status = ensemble_status;
+        if (previous_status.ensemble_id != ensemble_status.ensemble_id || previous_status.ecc != ensemble_status.ecc ||
+            previous_status.service_count != ensemble_status.service_count || previous_status.services_found != ensemble_status.services_found ||
+            previous_status.reconfiguration_counter != ensemble_status.reconfiguration_counter) {
+            last_service_change = std::chrono::steady_clock::now();
+        }
+        if (ensemble_status.ensemble_id != 0 && ensemble_acquired == std::chrono::steady_clock::time_point{}) {
+            ensemble_acquired = std::chrono::steady_clock::now();
+        }
 
 #if DAB_ENABLE_SCAN
         if (scan_active.load()) {
@@ -3502,6 +3562,10 @@ void TunerHandler::service_data_event(const FICDecoder::Service &service) {
         const std::lock_guard lock(state_mutex);
         new_service = !services.contains(service.id);
         selected_service = current_service_id == service.id;
+        if (new_service || services.at(service.id).label != service.label || services.at(service.id).short_label != service.short_label ||
+            services.at(service.id).ecc != service.ecc || services.at(service.id).subchannel != service.subchannel || services.at(service.id).dab_plus != service.dab_plus) {
+            last_service_change = std::chrono::steady_clock::now();
+        }
         services[service.id] = service;
 
 #if DAB_ENABLE_SCAN
@@ -3510,8 +3574,6 @@ void TunerHandler::service_data_event(const FICDecoder::Service &service) {
         }
 #endif
     }
-
-    notify_property_changes({"Services"});
 
 #if DAB_ENABLE_SPI && DAB_ENABLE_LOGO_CACHE
     if (service.ecc != 0 && service.ecc != ensemble_status.ecc) {
@@ -3537,6 +3599,7 @@ void TunerHandler::service_removed_event(const uint16_t service_id) {
     {
         const std::lock_guard lock(state_mutex);
         services.erase(service_id);
+        last_service_change = std::chrono::steady_clock::now();
 
 #if DAB_ENABLE_SCAN
         if (scan_active.load()) {
@@ -3563,7 +3626,6 @@ void TunerHandler::service_removed_event(const uint16_t service_id) {
 #endif
     }
 
-    notify_property_changes({"Services"});
     fic_logger.info(std::format("Service 0x{:04X} removed", service_id));
 }
 

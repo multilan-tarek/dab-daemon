@@ -25,7 +25,7 @@ Audio is muted while switching stations. Playback starts with a short 15 ms fade
 The `Services` tab lists the stations available on the current channel/ensemble.\
 The list includes station logos, audio parameters, PTY, language and announcements.
 
-The lower table lists their components and data applications.
+The station list appears once reception is complete. The lower table lists components and data applications.
 
 - Double-click a station or press `Open selected` to open it
 - Press `Close service` to close the current service
@@ -166,6 +166,7 @@ detection is retried once.
 
 Results remain available after the scan.\
 Click an ensemble or station to tune to it, including while a scan is still running.
+Opening a station waits for `ServicesReady` and checks the current station list.
 
 ![Full scan](images/full-scan.png)
 

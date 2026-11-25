@@ -54,6 +54,7 @@ MAX_LOGO_REQUESTS = 8
 MAX_FIC_FIGURES = 2048
 MAX_JOURNALINE_HISTORY = 128
 SCAN_TUNE_TIMEOUT = 5
+SERVICE_TUNE_TIMEOUT = 15
 AUDIO_CHANGE_ACTIONS = {
     "select_tuner", "set_frequency", "set_ensemble", "set_service",
     "close_service", "start_scan", "seek", "tune_scan_result",
@@ -1630,13 +1631,14 @@ if QT_AVAILABLE:
                 return
 
             try:
-                async with asyncio.timeout(SCAN_TUNE_TIMEOUT):
+                async with asyncio.timeout(SERVICE_TUNE_TIMEOUT):
                     while current():
-                        # Retuning clears Services; use the received FIC, not the scan snapshot.
+                        # Wait for a complete live list; older daemons do not expose ServicesReady.
                         values = await properties.call_get_all(TUNER_INTERFACE)
                         if not current() or values["Frequency"].value != frequency:
                             return
-                        if any(service[0] == service_id for service in values["Services"].value):
+                        ready = values.get("ServicesReady")
+                        if (ready is None or ready.value) and any(service[0] == service_id for service in values["Services"].value):
                             success = await tuner.call_set_service(int(service_id))
                             if current():
                                 self.message.emit("Service opened." if success else "Could not open service.")
